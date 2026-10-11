@@ -19,11 +19,11 @@ records it under ffs, replays the trace, and classifies the result:
   REPLAY_DIVERGED   the replayed events differ from the trace
   REPLAY_SHORT      replay ended before the end of the trace
   OUTPUT_MISMATCH   stdout of record and replay differ
-  STRICT_DIVERGED   replay with --strict (syscall return values compared)
-                    diverged although the plain replay did not
+  STRICT_DIVERGED   the second replay diverged; --strict is a compatibility
+                    alias, so both passes now use the same checks
   PASS
 
-Usage: run.py [--rr DIR] [--ffs BIN] [--out DIR] [-j N] [--only a,b,...]
+Usage: run.py [--rr DIR] [--ffs BIN] [--out DIR] [-j N] [--only a,b,...] [--verify-outputs]
 """
 import argparse, os, re, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -149,6 +149,7 @@ def run_test(t, a, bindir, workroot, nonce):
     env = dict(os.environ, LC_ALL='C', NONTMP_WORKDIR=wd)
     ffs = [a.ffs]
     extra = a.ffs_args
+    replay_extra = extra + (['--verify-outputs'] if a.verify_outputs else [])
     rec = os.path.join(wd, 'record.out')
     th = None
     if t['sig']:
@@ -175,14 +176,14 @@ def run_test(t, a, bindir, workroot, nonce):
         return 'REC_NOTOKEN', f'exit={rc} last="{tail}"'
     if not os.path.exists(os.path.join(wd, 'trace.json')):
         return 'REC_ERROR', 'no trace written'
-    rc = run_cmd(ffs + ['replay'] + extra + ['trace.json'], t['timeout'], wd,
+    rc = run_cmd(ffs + ['replay'] + replay_extra + ['trace.json'], t['timeout'], wd,
                  os.path.join(wd, 'replay.out'), os.path.join(wd, 'replay.err'), env)
     st, detail = replay_status(rc, os.path.join(wd, 'replay.err'))
     if st:
         return st, detail
     if open(os.path.join(wd, 'replay.out'), errors='replace').read() != out:
         return 'OUTPUT_MISMATCH', ''
-    rc = run_cmd(ffs + ['replay', '--strict'] + extra + ['trace.json'], t['timeout'], wd,
+    rc = run_cmd(ffs + ['replay', '--strict'] + replay_extra + ['trace.json'], t['timeout'], wd,
                  os.path.join(wd, 'strict.out'), os.path.join(wd, 'strict.err'), env)
     st, detail = replay_status(rc, os.path.join(wd, 'strict.err'))
     if st:
@@ -194,6 +195,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--rr', default=os.environ.get('RR_SRC', os.path.expanduser('~/repos/rr')))
     ap.add_argument('--ffs', default=os.path.join(HERE, '..', '..', 'target', 'release', 'ffs'))
+    ap.add_argument('--verify-outputs', action='store_true', help='verify captured output buffers on both replay passes')
     ap.add_argument('--ffs-args', default='', help='extra options for ffs record/replay')
     ap.add_argument('--out', default=os.path.join(HERE, 'out'))
     ap.add_argument('-j', type=int, default=max(1, (os.cpu_count() or 2) // 2))

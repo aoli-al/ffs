@@ -70,6 +70,9 @@ pub struct Task {
     pub exit_code: Option<i32>,
     /// The vDSO has been patched in this task's address space.
     pub vdso_patched: bool,
+    /// Application-visible PR_SET_TSC mode; the real mode stays SIGSEGV
+    /// so ffs can implement virtual rdtsc even when the application enables it.
+    pub tsc_mode: i32,
     /// The task reached a stop asynchronously (while blocked) that has not
     /// been reported to the scheduler yet.
     pub unreported: bool,
@@ -104,7 +107,15 @@ pub struct Task {
     /// An `Exit` event was reported for this task (replay bookkeeping for
     /// threads that die without an exit stop).
     pub exit_reported: bool,
+    /// The last resume was a `PTRACE_SINGLESTEP`.
+    stepping: bool,
+    /// The instruction being single-stepped is a `pushf`; this is the
+    /// address of the next instruction (see `after_single_step`).
+    pushf_target: Option<u64>,
 }
+
+/// The x86 trap flag.
+pub const X86_TF: u64 = 1 << 8;
 
 impl Task {
     pub fn new(tid: pid_t, tgid: pid_t, ltid: Ltid, pmu: &PmuConfig) -> Result<Task> {
@@ -125,6 +136,7 @@ impl Task {
             execs: 0,
             exit_code: None,
             vdso_patched: false,
+            tsc_mode: libc::PR_TSC_ENABLE,
             unreported: false,
             last_child: None,
             restarting: false,
@@ -138,6 +150,8 @@ impl Task {
             mem_restore: None,
             exit_status: None,
             exit_reported: false,
+            stepping: false,
+            pushf_target: None,
         })
     }
 
@@ -200,10 +214,56 @@ impl Task {
             self.syscall_nr = nr;
         }
         let sig = std::mem::replace(&mut self.pending_sig, 0);
+        self.pushf_target = None;
+        self.stepping = how == ResumeHow::SingleStep;
+        if self.stepping && sig == 0 {
+            // A single-stepped `pushf` pushes the flags with the trap flag
+            // the step itself set; a later `popf` would then re-enable
+            // single-stepping behind the tracer's back (the kernel stops
+            // attributing TF to the debugger across a popf) and the
+            // program would die of SIGTRAP.  Remember where the pushed
+            // word will be so the bit can be cleared after the step.
+            let rip = self.rip();
+            let mut insn = [0u8; 2];
+            if self.mem.read(rip, &mut insn).is_ok() {
+                if insn[0] == 0x9c {
+                    self.pushf_target = Some(rip + 1);
+                } else if insn == [0x66, 0x9c] {
+                    self.pushf_target = Some(rip + 2);
+                }
+            }
+        }
         self.hpc.start(budget)?;
         self.regs = None;
         ptrace::resume(self.tid, how, sig)?;
         self.state = State::Running;
+        Ok(())
+    }
+
+    /// Undo what a single step leaked into the tracee's view: the trap flag
+    /// in the word a `pushf` pushed, and a trap flag that became the
+    /// tracee's own (a stepped `popf` restoring such a word, or a signal
+    /// taken during the step; rr does the same in `Task::did_waitpid`).
+    fn after_single_step(&mut self, stop: Stop) -> Result<()> {
+        if matches!(stop, Stop::ExitEvent) {
+            return Ok(());
+        }
+        let mut r = ptrace::get_regs(self.tid)?;
+        if let Some(target) = self.pushf_target.take() {
+            if r.rip == target {
+                let mut w = [0u8; 2];
+                if self.mem.read(r.rsp, &mut w).is_ok() {
+                    let v = u16::from_ne_bytes(w) & !(X86_TF as u16);
+                    self.mem.write(r.rsp, &v.to_ne_bytes())?;
+                }
+            }
+        }
+        if r.eflags & X86_TF != 0 {
+            log::debug!("task {}: clearing leaked trap flag at {:#x}", self.tid, r.rip);
+            r.eflags &= !X86_TF;
+            ptrace::set_regs(self.tid, &r)?;
+        }
+        self.regs = Some(r);
         Ok(())
     }
 
@@ -236,6 +296,7 @@ impl Task {
                         ret: r.rax as i64,
                     }
                 } else {
+                    ptrace::check_syscall_abi(self.tid, r.orig_rax)?;
                     Stop::SyscallEntry { nr: r.orig_rax }
                 }
             }
@@ -267,6 +328,10 @@ impl Task {
             }
             WaitStatus::Signal(sig) => Stop::Signal { sig },
         };
+        if self.stepping {
+            self.stepping = false;
+            self.after_single_step(stop)?;
+        }
         self.state = State::Stopped(stop);
         Ok(Some(stop))
     }

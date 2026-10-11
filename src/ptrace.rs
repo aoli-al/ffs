@@ -84,6 +84,23 @@ pub fn resume(pid: pid_t, how: ResumeHow, sig: i32) -> Result<()> {
     Ok(())
 }
 
+/// Output descriptions and virtualization use the native x86-64 syscall ABI.
+/// Reject compat entry before interpreting its overlapping syscall numbers.
+pub fn check_syscall_abi(pid: pid_t, nr: u64) -> Result<()> {
+    let mut info: libc::ptrace_syscall_info = unsafe { std::mem::zeroed() };
+    let len = unsafe {
+        raw(libc::PTRACE_GET_SYSCALL_INFO, pid,
+            std::mem::size_of_val(&info) as *mut c_void,
+            &mut info as *mut _ as *mut c_void)?
+    };
+    const AUDIT_ARCH_X86_64: u32 = 0xc000003e;
+    const X32_SYSCALL_BIT: u64 = 0x40000000;
+    if len < 24 || info.arch != AUDIT_ARCH_X86_64 || (nr <= u32::MAX as u64 && nr & X32_SYSCALL_BIT != 0) {
+        bail!("unsupported syscall ABI: arch {:#x}, syscall {nr}; ffs requires native x86-64", info.arch);
+    }
+    Ok(())
+}
+
 pub fn get_regs(pid: pid_t) -> Result<Regs> {
     let mut regs = MaybeUninit::<Regs>::uninit();
     unsafe {

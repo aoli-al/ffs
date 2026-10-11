@@ -276,7 +276,8 @@ impl Session {
             }
             PPOLL | EPOLL_PWAIT2 | SELECT | PSELECT6 | RT_SIGTIMEDWAIT => {
                 let (ptr, set, ret): (u64, fn(&mut ptrace::Regs), i64) = match nr {
-                    PPOLL | EPOLL_PWAIT2 => (r.r10, |n| n.r10 = 0, 0),
+                    PPOLL => (r.rdx, |n| n.rdx = 0, 0),
+                    EPOLL_PWAIT2 => (r.r10, |n| n.r10 = 0, 0),
                     SELECT | PSELECT6 => (r.r8, |n| n.r8 = 0, 0),
                     _ => (r.rdx, |n| n.rdx = 0, -(libc::EAGAIN as i64)),
                 };
@@ -314,12 +315,15 @@ impl Session {
         if let Some((addr, bytes)) = t.mem_restore.take() {
             t.mem.write(addr, &bytes)?;
         }
-        if let (SELECT, Some(e), Some(d)) = (t.syscall_nr, t.entry_regs, deadline) {
-            // Linux updates select's timeout with the time left.
-            if e.r8 != 0 {
+        if let (SELECT | PPOLL | PSELECT6, Some(e), Some(d)) = (t.syscall_nr, t.entry_regs, deadline) {
+            // The raw select, pselect6 and ppoll syscalls update their
+            // timeout buffers (libc may hide this with a temporary copy).
+            let addr = if t.syscall_nr == PPOLL { e.rdx } else { e.r8 };
+            if addr != 0 {
                 let left = d.saturating_sub(now);
-                t.mem.write_u64(e.r8, left / 1_000_000_000)?;
-                t.mem.write_u64(e.r8 + 8, (left % 1_000_000_000) / 1000)?;
+                let divisor = if t.syscall_nr == SELECT { 1000 } else { 1 };
+                t.mem.write_u64(addr, left / 1_000_000_000)?;
+                t.mem.write_u64(addr + 8, (left % 1_000_000_000) / divisor)?;
             }
         }
         if let Some(e) = t.entry_regs.take() {
@@ -635,7 +639,11 @@ impl Session {
         let Some((_, ret)) = self.task(tid)?.vdeadline else { return Ok(()) };
         self.interrupt_blocked(tid)?;
         let t = self.task_mut(tid)?;
-        if !t.restarting {
+        // epoll waits are not restartable: PTRACE_INTERRUPT makes them
+        // return EINTR instead of an internal ERESTART result.
+        let interrupted = matches!(t.stop(), Some(Stop::SyscallExit { ret, .. })
+            if ret == -(libc::EINTR as i64));
+        if !t.restarting && !interrupted {
             // It completed for real just before (left unreported), or died.
             return Ok(());
         }

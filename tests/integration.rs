@@ -21,6 +21,43 @@ fn build_tests() {
     });
 }
 
+/// Build the Java harnesses (tests/java/build.py) once; None without a JDK.
+fn build_java() -> Option<PathBuf> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: Once = Once::new();
+    static OK: AtomicBool = AtomicBool::new(false);
+    ONCE.call_once(|| {
+        if Command::new("javac").arg("-version").output().is_err() {
+            eprintln!("javac not found; skipping Java tests");
+            return;
+        }
+        let st = Command::new("python3")
+            .arg(root().join("tests/java/build.py"))
+            .status()
+            .expect("run build.py");
+        assert!(st.success(), "building tests/java failed");
+        OK.store(true, Ordering::SeqCst);
+    });
+    if OK.load(Ordering::SeqCst) {
+        Some(root().join("tests/bin/java"))
+    } else {
+        None
+    }
+}
+
+/// Command line of a Java harness class under `variant` (buggy/fixed).
+fn java_args(java: &Path, variant: &str, class: &str) -> Vec<String> {
+    vec![
+        "java".into(),
+        // The JVM lists /tmp/hsperfdata_<user> at startup: live state.
+        "-XX:-UsePerfData".into(),
+        format!("-Djava.library.path={}", java.display()),
+        "-cp".into(),
+        java.join(variant).display().to_string(),
+        class.into(),
+    ]
+}
+
 fn prog(name: &str) -> PathBuf {
     build_tests();
     root().join("tests/bin").join(name)
@@ -395,4 +432,203 @@ fn checkpoint_preserves_the_process_tree() {
 #[allow(dead_code)]
 fn exists(p: &Path) -> bool {
     p.exists()
+}
+
+#[test]
+fn shadow_replay_checks_live_inputs() {
+    let d = tmpdir("replay-inputs");
+    let input = d.join("input");
+    let trace = d.join("trace.json");
+    for mode in ["read", "readv", "offset", "stat"] {
+        std::fs::write(&input, b"original").unwrap();
+        let (out, text) = run(ffs().args(["record", "--ticks", "none", "--policy", "fifo", "-o"])
+            .arg(&trace).arg("--").arg(prog("replay_inputs")).arg(mode).arg(&input));
+        assert!(out.status.success(), "record {mode}: {text}");
+        let (out, text) = run(ffs().args(["replay", "--ticks", "none"]).arg(&trace));
+        assert!(out.status.success(), "unchanged replay {mode}: {text}");
+        // Same return count, different contents: the default check accepts
+        // the live result; the optional buffer check catches the changed bytes.
+        std::fs::write(&input, b"modified").unwrap();
+        let (out, text) = run(ffs().arg("replay").arg(&trace));
+        assert!(out.status.success(), "matching live return values {mode}: {text}");
+        if mode != "stat" {
+            assert!(text.contains("modified"), "replay did not use live bytes: {text}");
+        }
+        let (out, text) = run(ffs().args(["replay", "--verify-outputs"]).arg(&trace));
+        assert_eq!(out.status.code(), Some(5), "changed input {mode}: {text}");
+        assert!(text.contains("syscall output bytes"), "{text}");
+        // A shorter file changes read's scalar return value as well.
+        if mode != "stat" {
+            std::fs::write(&input, b"x").unwrap();
+            let (out, text) = run(ffs().arg("replay").arg(&trace));
+            assert_eq!(out.status.code(), Some(5), "changed read count {mode}: {text}");
+            assert!(text.contains("= 8") && text.contains("= 1"), "{text}");
+        }
+        // A failed live open/stat must not be replaced with recorded success.
+        std::fs::remove_file(&input).unwrap();
+        let (out, text) = run(ffs().arg("replay").arg(&trace));
+        assert_eq!(out.status.code(), Some(5), "missing input {mode}: {text}");
+        assert!(text.contains("= -2"), "{text}");
+    }
+}
+
+#[test]
+fn async_memory_interfaces_are_refused() {
+    let d = tmpdir("refuse-async");
+    let trace = d.join("trace.json");
+    let (out, text) = run(ffs().args(["record", "--ticks", "none", "--policy", "fifo", "-o"])
+        .arg(&trace).arg("--").arg(prog("replay_inputs")).arg("async"));
+    assert!(out.status.success(), "{text}");
+    let (out, text) = run(ffs().args(["replay", "--ticks", "none"]).arg(&trace));
+    assert!(out.status.success(), "{text}");
+}
+
+
+#[test]
+fn replay_rejects_changed_returns_buffers_and_incomplete_execution() {
+    let d = tmpdir("replay-checks");
+    let trace = d.join("trace.json");
+    let bad = d.join("bad.json");
+    let (out, text) = run(ffs().args(["record", "--ticks", "none", "--policy", "fifo", "-o"])
+        .arg(&trace).arg("--").arg(prog("replay_inputs")).arg("pipe"));
+    assert!(out.status.success(), "{text}");
+    // The source and slice settings come from the trace without CLI overrides.
+    let (out, text) = run(ffs().arg("replay").arg(&trace));
+    assert!(out.status.success(), "{text}");
+    let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&trace).unwrap()).unwrap();
+    let mut changed = original.clone();
+    let write = changed["steps"].as_array_mut().unwrap().iter_mut()
+        .find(|s| s["event"]["SyscallExit"]["nr"] == 1).unwrap();
+    write["event"]["SyscallExit"]["ret"] = serde_json::json!(7);
+    std::fs::write(&bad, serde_json::to_vec(&changed).unwrap()).unwrap();
+    let (out, text) = run(ffs().arg("replay").arg(&bad));
+    assert_eq!(out.status.code(), Some(5), "return mismatch: {text}");
+    let mut changed = original.clone();
+    let read = changed["steps"].as_array_mut().unwrap().iter_mut()
+        .find(|s| s["event"]["SyscallExit"]["nr"] == 0).unwrap();
+    read["effects"]["out"][0]["bytes"][0] = serde_json::json!(0);
+    std::fs::write(&bad, serde_json::to_vec(&changed).unwrap()).unwrap();
+    let (out, text) = run(ffs().args(["replay", "--verify-outputs"]).arg(&bad));
+    assert_eq!(out.status.code(), Some(5), "buffer mismatch: {text}");
+    assert!(text.contains("syscall output bytes"), "{text}");
+    let (out, text) = run(ffs().args(["replay", "--max-steps", "1"]).arg(&trace));
+    assert_eq!(out.status.code(), Some(5), "incomplete replay: {text}");
+    assert!(!text.contains("replayed all"), "{text}");
+    // Old schedules remain readable, with an explicit opt-out of return checks.
+    let mut legacy = original;
+    legacy["version"] = serde_json::json!(1);
+    legacy.as_object_mut().unwrap().remove("execution");
+    for step in legacy["steps"].as_array_mut().unwrap() {
+        step.as_object_mut().unwrap().remove("effects");
+    }
+    std::fs::write(&bad, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let (out, text) = run(ffs().args(["replay", "--ticks", "none", "--lenient"]).arg(&bad));
+    assert!(out.status.success(), "legacy replay: {text}");
+}
+
+#[test]
+fn timerfd_is_refused_with_virtual_time() {
+    let d = tmpdir("refuse-timerfd");
+    let (out, text) = run(ffs().args(["record", "--ticks", "none", "--policy", "fifo", "-o"])
+        .arg(d.join("trace.json")).arg("--").arg(prog("replay_inputs")).arg("timerfd"));
+    assert!(out.status.success(), "{text}");
+}
+
+#[test]
+fn syscall_only_recordings_repeat_without_host_time_slices() {
+    let d = tmpdir("same-seed");
+    let input = d.join("input");
+    std::fs::write(&input, b"original").unwrap();
+    let trace = d.join("trace.json");
+    let mut previous = None;
+    for _ in 0..3 {
+        let (out, text) = run(ffs().args([
+            "record", "--ticks", "none", "--slice-cap-ms", "0",
+            "--block-grace-us", "0", "--seed", "42", "-o",
+        ]).arg(&trace).arg("--").arg(prog("replay_inputs")).arg("read").arg(&input));
+        assert!(out.status.success(), "{text}");
+        let t: serde_json::Value = serde_json::from_slice(&std::fs::read(&trace).unwrap()).unwrap();
+        let steps = t["steps"].clone();
+        assert!(!steps.as_array().unwrap().iter().any(|s| s["event"] == "Slice"));
+        if let Some(previous) = previous {
+            assert_eq!(steps, previous, "same-seed syscall-only run changed");
+        }
+        previous = Some(steps);
+    }
+}
+
+
+#[test]
+fn compat_syscall_abi_is_rejected_before_virtualization() {
+    let d = tmpdir("compat-syscall");
+    let (out, text) = run(ffs().args(["record", "--ticks", "none", "--policy", "fifo", "-o"])
+        .arg(d.join("trace.json")).arg("--").arg(prog("replay_inputs")).arg("compat"));
+    assert_eq!(out.status.code(), Some(70), "{text}");
+    assert!(text.contains("unsupported syscall ABI"), "{text}");
+}
+
+
+#[test]
+fn shadow_replay_verifies_virtual_time_and_process_ids() {
+    let d = tmpdir("shadow-virtual");
+    let trace = d.join("trace.json");
+    let (record, text) = run(ffs().args(["record", "--ticks", "none", "--policy", "fifo", "-o"])
+        .arg(&trace).arg("--").arg(prog("replay_inputs")).arg("virtual"));
+    assert!(record.status.success(), "{text}");
+    let (replay, text) = run(ffs().args(["replay", "--verify-outputs"]).arg(&trace));
+    assert!(replay.status.success(), "virtualized outputs differ: {text}");
+    assert_eq!(record.stdout, replay.stdout, "time and pid/tid must match");
+}
+
+#[test]
+fn shadow_replay_preserves_kernel_semantics() {
+    let d = tmpdir("kernel-semantics");
+    // Reproduce Nix's long TMPDIR without relying on the surrounding shell.
+    let long_tmp = d.join("a-temporary-directory-longer-than-the-cpu-online-path");
+    std::fs::create_dir_all(&long_tmp).unwrap();
+    for mode in ["waits", "clone_parent", "tsc", "cpu", "vm_write"] {
+        let trace = d.join(format!("{mode}.json"));
+        let (record, text) = run(ffs().env("TMPDIR", &long_tmp).args([
+            "record", "--ticks", "none", "--slice-cap-ms", "0", "--policy", "fifo", "-o",
+        ]).arg(&trace).arg("--").arg(prog("kernel_semantics")).arg(mode));
+        assert!(record.status.success(), "{mode}: {text}");
+        let (replay, text) = run(ffs().env("TMPDIR", &long_tmp)
+            .args(["replay", "--verify-outputs"]).arg(&trace));
+        assert!(replay.status.success(), "{mode}: {text}");
+        assert_eq!(record.stdout, replay.stdout, "{mode}");
+    }
+}
+
+/// FLINK-37663: the real `FutureCompletingBlockingQueue` loses a putter's
+/// wakeup when `wakeUpPuttingThread` signals a condition still queued in
+/// `notFull`.  The JVM (JIT, GC and safepoint signals, 16 threads at the
+/// checkpoint) runs under ffs; the failing schedule replays from a cold
+/// start; the upstream fix passes.
+#[test]
+fn explore_finds_flink_37663_in_the_jvm() {
+    let Some(java) = build_java() else { return };
+    let d = tmpdir("flink37663");
+    let mut cmd = ffs();
+    cmd.args(["explore", "--iterations", "50", "--seed", "1", "--output-dir"])
+        .arg(&d)
+        .arg("--")
+        .args(java_args(&java, "buggy", "Flink37663"));
+    let (out, text) = run(&mut cmd);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("FLINK-37663: producer B stranded"), "{text}");
+    assert!(text.contains("re-execution from the checkpoint: reproduced"), "{text}");
+
+    let (out, text) = run(ffs().arg("replay").arg(d.join("fail-1.json")));
+    assert_eq!(out.status.code(), Some(2), "cold replay of the JVM trace:\n{text}");
+    assert!(text.contains("ASSERTION FAILED: FLINK-37663"), "{text}");
+    assert!(text.contains("replayed all"), "{text}");
+
+    let d = tmpdir("flink37663-fixed");
+    let mut cmd = ffs();
+    cmd.args(["explore", "--iterations", "30", "--seed", "1", "--output-dir"])
+        .arg(&d)
+        .arg("--")
+        .args(java_args(&java, "fixed", "Flink37663"));
+    let (out, text) = run(&mut cmd);
+    assert_eq!(out.status.code(), Some(0), "fixed queue failed under exploration:\n{text}");
 }

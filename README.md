@@ -3,7 +3,7 @@
 `ffs` is a Linux/x86-64 concurrency testing tool written in Rust. It runs an
 unmodified multithreaded program under `ptrace`, serializes its threads onto a
 deterministic scheduler (one tracee thread runs at a time), records the
-schedule, and replays it exactly. Its distinguishing feature, and the reason it
+schedule, and checks replay against it. Its distinguishing feature, and the reason it
 exists, is **checkpointing**: at any scheduling point the whole process — every
 thread, and every process the program forked — can be cloned with `fork`, and
 alternative schedules can then be explored from that point without re-running
@@ -14,15 +14,12 @@ The mechanisms follow [rr](https://rr-project.org): hardware "ticks"
 thread's progress deterministically and let the tracer stop a thread at an exact
 instruction; syscalls are intercepted at ptrace syscall stops; checkpoints are
 made by injecting `clone`/`fork` syscalls into the stopped tracee the way rr's
-`AutoRemoteSyscalls`/`Task::os_fork_into` do. Unlike rr, `ffs` does not record
-syscall results for replay: tracees really execute from checkpoints, so
-different schedules can be run from the same point. Determinism therefore
-comes from controlling every input the kernel would otherwise generate
-nondeterministically — thread interleaving, time, randomness, process and
-thread ids, timers, signals — and from making checkpoint copies faithful to
-the original down to the kernel state the program can observe. Where rr
-*replays* a recorded value, `ffs` *virtualizes* the facility, so that the value
-is a function of the schedule.
+`AutoRemoteSyscalls`/`Task::os_fork_into` do. `ffs` keeps live kernel objects so checkpoint branches can run
+new schedules. Replay is **shadow execution**: ordinary syscalls execute
+again and their return values must match the recording. The same time,
+randomness and process-identity virtualization applies during recording and
+replay. The user is responsible for controlling external inputs and resetting
+file or network side effects before replay.
 
 ## Building
 
@@ -129,9 +126,10 @@ sources: instruction counter, or no preemption at all), and the opt-outs
 
 ## What is deterministic
 
-Given the same program, inputs on disk and seed, a recorded schedule replays
-step for step, and every branch of an exploration is a pure function of the
-scheduling decisions made in it. This covers:
+ffs controls many sources of nondeterminism, but does not guarantee identical
+runs from the same seed or bit-exact replay for arbitrary Linux programs.
+A saved schedule controls interleaving more precisely than a seed alone.
+The following facilities are controlled:
 
 * **Thread interleaving.** Exactly one thread runs at a time; switches happen
   at syscalls, at tick-counted preemptions (exact to the instruction), at
@@ -203,11 +201,68 @@ scheduling decisions made in it. This covers:
   of every branch. Every branch therefore starts from the same files, and
   the working directory is left as the exploration found it.
 
-Not covered — the price of re-executing instead of replaying syscall results:
-the *contents* of files read, pipes to the outside world, the network and the
-terminal are whatever they are when the branch runs. Programs whose control
-flow depends on such external input are deterministic only as long as that
-input is.
+### Shadow replay
+
+New traces use version 2. Replay checks syscall return values by default,
+rejects incomplete execution and terminal-outcome mismatches. With
+`--verify-outputs`, it also compares captured syscall buffers before resuming
+another thread. `--strict` remains a
+compatibility alias; `--lenient` disables return-value checks only for legacy
+version 1 traces, which do not contain recorded buffers.
+
+Captured successful outputs currently cover native x86-64 `read`, `pread64`, `readv`,
+`preadv`, `preadv2`, `process_vm_readv`, `getdents`, `getdents64`, `getrandom`, `stat`/`fstat`/
+`lstat`/`newfstatat`/`statx`, `readlink`/`readlinkat`, `uname`, `sysinfo`,
+`statfs`/`fstatfs`, `gettimeofday`, `time`, `clock_gettime`, and `clock_getres`.
+Buffers are stored inline in JSON, limited to 64 MiB per captured syscall.
+Compat/i386 and x32 syscall entries are rejected before applying the native
+ABI output descriptions; syscall inspection requires Linux 5.3 or newer.
+Unsupported syscalls and partial memory writes from failed syscalls have no
+buffer verification.
+
+Reads, metadata queries, directory enumeration and writes execute against
+live kernel state. Recorded values never replace their results, and replay
+does not restore fd offsets from the trace. A different return value, including
+an errno difference, is a replay divergence (exit code 5). Values are compared
+**after** ffs's normal virtualization, so clocks and process identities use
+the same model in record and replay.
+
+Output-buffer verification is optional because metadata can contain incidental
+kernel state such as inode numbers for a newly created stdout pipe. It also
+catches changes that scalar returns cannot: `read` can return eight different
+bytes while still returning 8. Even with the option enabled, buffer coverage
+is partial, as listed above.
+
+The user must arrange repeatable inputs and avoid, isolate or reset external
+side effects. Existing exploration file snapshots are a convenience for the
+operations they cover, not a replacement for this responsibility. A passing
+shadow replay verifies recorded observations; it is not an archive of the
+original machine's state.
+
+Version 2 also records the tick source, slice-cap duration and use of a PID
+namespace. Replay restores those settings and rejects a mismatched PMU or an
+unavailable required PID namespace.
+
+### Remaining nondeterminism
+
+The seed does not determine host-timed slice preemptions, hardware overflow
+interrupt skid, external signals, or kernel readiness and wake ordering.
+Synchronous regular-file I/O and known synchronous queries no longer become
+`Blocked` scheduling events merely because the disk or host is slow.
+`--slice-cap-ms 0` disables wall-clock slice preemption, but branchless loops
+may then run forever; this alone does not make same-seed runs deterministic.
+
+Network and terminal input, external pipes, many ioctls, kernel-generated
+object ids and file-backed mappings still depend on live state. Successful
+replay means the recorded checks passed, not that every byte of process or
+kernel state was identical.
+
+Asynchronous-memory interfaces (`io_setup`, `io_submit`, `io_uring_*`,
+`userfaultfd`, `perf_event_open`) return `ENOSYS` under
+ffs. `timerfd_*` also return `ENOSYS` with virtual time, until their counters
+and readiness can be virtualized; `--real-time` allows native timerfds.
+Inherited asynchronous resources and direct hardware randomness are not
+covered by these syscall guards.
 
 ## How it works
 
@@ -322,6 +377,78 @@ ids, a list of exited-but-not-waited-for children, and answers `wait4`/`waitid`
 `si_pid`, `si_status`) from it. Stopped/continued children are not reported
 (tracees never stop).
 
+## Java programs (`tests/java/`)
+
+A JVM is an ordinary multithreaded tracee: `ffs` runs OpenJDK 17 unmodified,
+including the JIT compiler threads, the garbage collector, safepoint polls and
+implicit null checks (which HotSpot implements with `SIGSEGV`), with no
+special support. `tests/java/Ffs.java` is a tiny JNI shim over `include/ffs.h`
+so a harness can call `Ffs.begin()`, `Ffs.check(cond, msg)` and
+`Ffs.yield()`; `tests/java/build.py` compiles the harnesses into
+`tests/bin/java/{buggy,fixed}`.
+
+Pass `-XX:-UsePerfData`. At startup HotSpot lists `/tmp/hsperfdata_<user>` to
+clean stale files, so the directory's contents (left by killed branches or
+other JVMs) are live input that makes a cold replay diverge on `getdents64`.
+
+### FLINK-37663
+
+`tests/java/flink/FutureCompletingBlockingQueue.java` is the queue from
+Flink's connector base, verbatim. `wakeUpPuttingThread` signals a putter's
+condition but leaves it in the `notFull` queue, so a later `signalNextPutter()`
+wakes a thread that is no longer waiting and the putter that is waiting
+stays stranded ([FLINK-37663](https://issues.apache.org/jira/browse/FLINK-37663)).
+`Flink37663.java` sets up a queue of capacity 1 with two blocked producers,
+calls `Ffs.begin()`, wakes producer A and polls once; the property is that
+producer B completes. `build.py` also produces the `fixed` variant with the
+upstream fix (remove the condition from `notFull` when the wait ends).
+
+```
+$ ffs explore --iterations 200 --keep-going -- java -XX:-UsePerfData \
+    -Djava.library.path=tests/bin/java -cp tests/bin/java/buggy Flink37663
+[ffs] reached exploration root after 6846 steps: ffs_begin()
+[ffs] root checkpoint taken (16 threads); strategy=random
+[ffs] branch 2: FAILURE assertion failed: FLINK-37663: producer B stranded after consumer freed a slot ...
+[ffs]   re-execution from the checkpoint: reproduced
+...
+[ffs] explored 200 branches, 155 failing
+$ ffs replay ffs-out/fail-1.json          # cold replay, from JVM start
+[ffs] replayed all 12474 steps with recorded checks
+[ffs] ASSERTION FAILED: FLINK-37663: producer B stranded after consumer freed a slot
+```
+
+| variant | policy | branches | failing |
+|---|---|---:|---:|
+| buggy | random (`mix`) | 200 | 155 |
+| buggy | PCT | 100 | 100 |
+| fixed | random | 200 | 0 |
+
+Each branch is a fork of the JVM at the checkpoint and takes about 50 ms
+(a failing one waits 10 virtual seconds for B, which is instant in real
+time but lets the JVM's periodic tasks run). A plain `ffs record` of the
+harness also finds the bug in roughly 40% of runs, and every recording
+replays exactly (`replayed all N steps with recorded checks`). Natively the
+harness passes.
+
+Running the JVM exposed three bugs in ffs, all fixed:
+
+* **`pushf`/`popf` under single-stepping.** HotSpot's generated code saves and
+  restores the flags. A single-stepped `pushf` pushes the trap flag the step
+  set, and the kernel stops attributing TF to the debugger across a `popf`
+  (`is_setting_trap_flag`), so after the `popf` the program kept trapping on
+  every instruction and died of `SIGTRAP`. ffs now clears TF in the pushed
+  word after stepping a `pushf` and clears a trap flag that became visible
+  after a step, as rr's `Task::did_waitpid` does.
+* **Checkpoint copies of a joined thread.** glibc 2.44 makes a thread's
+  `clear_child_tid` address its join-state word, not its tid. Recreating
+  threads in a checkpoint with `CLONE_CHILD_SETTID` wrote the tid into that
+  word, so a `pthread_join` in the copy got `EAGAIN` and the saved trace
+  did not replay from a cold start. Copies now use `CLONE_CHILD_CLEARTID`
+  only.
+* **`restart_syscall` labels.** A timed `poll` interrupted by the preemption
+  signal is restarted by the kernel through `restart_syscall`; its exit was
+  recorded with number 219 instead of the original call's.
+
 ## Results on rr's test suite
 
 `tests/rr/` runs rr's own test programs under `ffs record`/`ffs replay`;
@@ -423,5 +550,6 @@ src/trace.rs       trace format
 src/vdso.rs        vDSO patching
 include/ffs.h      tracee-side API
 tests/c/           example programs with concurrency bugs and fidelity checks
+tests/java/        JNI shim, Flink's FutureCompletingBlockingQueue, FLINK-37663 harness
 tests/integration.rs
 ```

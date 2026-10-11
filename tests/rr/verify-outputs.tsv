@@ -1,0 +1,566 @@
+64bit_child	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 243: |   expected: T1   -> fstat = 0 @54199:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @54199:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+_llseek	PASS	
+abort	PASS	
+accept	PASS	
+acct	PASS	
+adjtimex	PASS	
+aio	PASS	
+alarm	PASS	
+alarm2	PASS	
+alsa_ioctl	PASS	
+arch_prctl_x86	PASS	
+arch_prctl_xstate	PASS	
+async_segv_ignored	PASS	
+async_signal_jit	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 239: |   expected: T1   -> write = 13 @53671:0x7ffff7d1cf00 |   actual:   T1   -> write = 31 @53621:0x7ffff7d1cf00
+at_threadexit	PASS	
+bad_ip	PASS	
+bad_syscall	PASS	
+barrier	PASS	
+big_buffers	PASS	
+big_select	PASS	
+block	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 449: |   expected: T2   -> fstat = 0 @1589:0x7ffff7d15d4b |   actual:   T2   -> fstat = 0 @1589:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+block_open	PASS	
+bpf	PASS	
+bpf_map	PASS	
+bpf_prog_map	PASS	
+bpf_query	PASS	
+brk	PASS	
+brk2	PASS	
+capget	PASS	
+chew_cpu	PASS	
+chew_cpu_cpuid	PASS	
+chmod	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 223: |   expected: T1   -> openat = 3 @53361:0x7ffff7d1b5b7 |   actual:   T1   -> openat = -13 @53361:0x7ffff7d1b5b7
+chown	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 252: |   expected: T1   -> fstat = 0 @54944:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @54944:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+clock	PASS	
+clock_adjtime	PASS	
+clock_nanosleep	PASS	
+clock_time64	PASS	
+clone	PASS	
+clone_bad_stack	PASS	
+clone_bad_tls	PASS	
+clone_cleartid_coredump	PASS	
+clone_fail	PASS	
+clone_immediate_exit	PASS	
+clone_newflags	PASS	
+clone_parent	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/clone_parent.c:29: !(exit_code_sum == 153) errno:10 (No child processes)"
+clone_untraced	PASS	
+clone_vfork_pidfd	PASS	
+cloned_sigmask	PASS	
+close_range	REC_NOTOKEN	exit=134 last="(no output)"
+constructor	BUILD_FAIL	collect2: error: ld returned 1 exit status
+copy_file_range	PASS	
+cpuid_same_state	PASS	
+creat_address_not_truncated	PASS	
+cross_arch	REC_ERROR	[ffs] error: unsupported syscall ABI: arch 0x40000003, syscall 4; ffs requires native x86-64
+cwd_inaccessible	PASS	
+daemon	PASS	
+deferred_patch	PASS	
+desched_blocking_poll	PASS	
+desched_sigkill	PASS	
+detach_huge_mmap	PASS	
+detach_state	PASS	
+detach_threads	PASS	
+detach_sigkill	PASS	
+detach_sigkill_exit	PASS	
+deterministic_sigsys	PASS	
+dev_zero	PASS	
+direct	PASS	
+dlchecksum	OUTPUT_MISMATCH	
+dup	PASS	
+doublesegv	PASS	
+epoll_create	PASS	
+epoll_create1	PASS	
+epoll_edge	PASS	
+epoll_many	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/epoll_many.c:22: !(0 == epoll_wait(fd, (struct epoll_event*)p, BUFFER_SIZE/sizeof"
+epoll_pwait_eintr_sigmask	PASS	
+epoll_pwait2	PASS	
+eventfd	PASS	
+exec_flags	PASS	
+exec_no_env	PASS	
+exec_self	PASS	
+exec_from_main_thread	PASS	
+exec_from_other_thread	REC_NOTOKEN	exit=134 last="..FAILED at /home/aoli/repos/rr/src/test/exec_from_other_thread.c:31: !(child == waitpid(child, &status, 0)) errno:10 (N"
+exec_stopsig	PASS	
+execveat	PASS	
+exit_with_syscallbuf_signal	PASS	
+fadvise	PASS	
+fatal_init_signal	PASS	
+fatal_sigsegv_thread	PASS	
+fault_in_code_page	REC_NOTOKEN	exit=139 last="calling fn(), faulting ..."
+fcntl_dupfd	PASS	
+fcntl_lease	PASS	
+fcntl_misc	PASS	
+fcntl_notify	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 247: |   expected: T1   -> ? = 0 @53412:0x7ffff7d1b39b |   actual:   T1   -> ? = -17 @53412:0x7ffff7d1b39b
+fcntl_owner_ex	PASS	
+fcntl_rw_hints	PASS	
+fcntl_seals	PASS	
+fcntl_sig	PASS	
+fd_cleanup	PASS	
+fd_tracking_across_threads	PASS	
+fds_clean	PASS	
+fexecve	PASS	
+fexecve_memfd	PASS	
+flock	PASS	
+flock_ofd	PASS	
+flock2	PASS	
+fork_brk	PASS	
+fork_child_crash	PASS	
+fork_many	PASS	
+fsmount	PASS	
+fstatat	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 236: |   expected: T1   -> newfstatat = 0 @53731:0x7ffff7d15d8e |   actual:   T1   -> newfstatat = 0 @53731:0x7ffff7d15d8e (syscall output bytes or addresses differ)
+futex_exit_race	PASS	
+futex_exit_race_sigsegv	REC_TIMEOUT	[ffs] recorded 721 steps to trace.json | [ffs] program exited normally
+futex_invalid_op	PASS	
+futex_pi	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/futex_pi.c:10: !(ret == -1 && errno == ENOSYS) errno:0 (Success)"
+futex_priorities	PASS	
+futex_requeue	PASS	
+futex_restart_race	PASS	
+futex_restart_clone	PASS	
+gcrypt_rdrand	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/gcrypt_rdrand.c:8: !(file != NULL) errno:2 (No such file or directory)"
+getcpu	PASS	
+getgroups	PASS	
+getpwnam	PASS	
+getrandom	PASS	
+setitimer	PASS	
+getsid	PASS	
+gettimeofday	PASS	
+grandchild_threads	PASS	
+grandchild_threads_main_running	REC_TIMEOUT	[ffs] recorded 307 steps to trace.json | [ffs] program exited normally
+grandchild_threads_thread_running	REC_TIMEOUT	[ffs] recorded 299 steps to trace.json | [ffs] program exited normally
+grandchild_threads_parent_alive	PASS	
+group_stop_thundering_herd	PASS	
+hle	PASS	
+hlt	PASS	
+inotify	PASS	
+int3	PASS	
+intr_futex_wait_restart	PASS	
+intr_poll	PASS	
+intr_ppoll	PASS	
+intr_pselect	PASS	
+intr_read_no_restart	PASS	
+intr_read_restart	PASS	
+intr_sleep	PASS	
+intr_sleep_no_restart	PASS	
+invalid_exec	PASS	
+invalid_fcntl	PASS	
+invalid_ioctl	PASS	
+io	PASS	
+io_uring	PASS	
+ioctl	PASS	
+ioctl_blk	PASS	
+ioctl_br	PASS	
+ioctl_fb	PASS	
+ioctl_fs	PASS	
+ioctl_pty	PASS	
+ioctl_sg	PASS	
+ioctl_tty	PASS	
+ioctl_ttyS	PASS	
+ioctl_vt	PASS	
+ioprio	PASS	
+ioperm	PASS	
+iopl	PASS	
+join_threads	PASS	
+joystick	PASS	
+kcmp	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/kcmp.c:15: !(0 < syscall(RR_kcmp, pid, getppid(), RR_KCMP_FILES, 0L, 0L)) errno:1"
+keyctl	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 232: |   expected: T1   -> ? = 138687162 @53033:0x7ffff7d2966d |   actual:   T1   -> ? = 616884215 @53033:0x7ffff7d2966d
+kill_newborn	PASS	
+kill_ptracee	REC_TIMEOUT	
+landlock	PASS	
+la57	PASS	
+large_hole	PASS	
+large_write_deadlock	PASS	
+legacy_ugid	PASS	
+lsl	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 230: |   expected: T1   -> write = 2 @52192:0x7ffff7d1cf00 |   actual:   T1   -> write = 3 @52193:0x7ffff7d1cf00
+madvise	PASS	
+madvise_dontneed_private	PASS	
+madvise_free	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/madvise_free.c:11: !(-1 == madvise(p, page_size, MADV_FREE)) errno:0 (Success)"
+madvise_misc	PASS	
+madvise_remove	PASS	
+madvise_wipeonfork	PASS	
+map_fixed	PASS	
+map_shared_syscall	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 247: |   expected: T1   -> fstat = 0 @54423:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @54423:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+membarrier	PASS	
+memfd_create	PASS	
+memfd_create_efault	PASS	
+memfd_create_shared	PASS	
+memfd_create_shared_huge	PASS	
+memfd_create_dotnet_huge_mapping	PASS	
+mincore	PASS	
+mknod	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 239: |   expected: T1   -> newfstatat = 0 @53993:0x7ffff7d15d8e |   actual:   T1   -> newfstatat = 0 @53993:0x7ffff7d15d8e (syscall output bytes or addresses differ)
+mlock	PASS	
+mlock_madvise	PASS	
+mmap_adjacent_to_rr_usage	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 239: |   expected: T1   -> fstat = 0 @54013:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @54013:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+mmap_huge	PASS	
+mmap_private	PASS	
+mmap_private_grow_under_map	PASS	
+mmap_recycle	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 232: |   expected: T1   -> ? = -2 @55018:0x7ffff7d1ccbb |   actual:   T1   -> ? = 0 @55018:0x7ffff7d1ccbb
+mmap_ro	PASS	
+mmap_self_maps_shared	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 236: |   expected: T1   -> fstat = 0 @53793:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @53793:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+mmap_shared	PASS	
+mmap_shared_dev_zero	PASS	
+mmap_shared_grow	PASS	
+mmap_shared_grow_under_map	PASS	
+mmap_shared_multiple	PASS	
+mmap_shared_subpage	PASS	
+mmap_shared_write	PASS	
+mmap_shared_write_fork	PASS	
+mmap_short_file	PASS	
+mmap_write_complex	PASS	
+mmap_zero_size_fd	PASS	
+modify_ldt	PASS	
+mount_ns_exec	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 294: |   expected: T1   -> ? = 0 @55288:0x7ffff7d1b39b |   actual:   T1   -> ? = -17 @55288:0x7ffff7d1b39b
+mount_ns_exec2	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 297: |   expected: T1   -> ? = 0 @56257:0x7ffff7d1b39b |   actual:   T1   -> ? = -17 @56257:0x7ffff7d1b39b
+mount_ns_execveat	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 299: |   expected: T1   -> ? = 0 @55021:0x7ffff7d1b39b |   actual:   T1   -> ? = -17 @55021:0x7ffff7d1b39b
+mprotect	PASS	
+mprotect_heterogenous	PASS	
+mprotect_none	PASS	
+mprotect_stack	PASS	
+mremap	PASS	
+mremap_after_coalesce	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/mremap_after_coalesce.c:14: !(end > 0) errno:9 (Bad file descriptor)"
+mremap_dontunmap	PASS	
+mremap_grow	PASS	
+mremap_grow_shared	PASS	
+mremap_non_page_size	PASS	
+mremap_overwrite	PASS	
+mremap_private_grow_under_map	PASS	
+mremap_shrink	PASS	
+msg	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 221: |   expected: T1   -> ? = 12 @53863:0x7ffff7d2f26b |   actual:   T1   -> ? = 13 @53863:0x7ffff7d2f26b
+msg_trunc	PASS	
+msync	PASS	
+mtio	PASS	
+multiple_pending_signals	PASS	
+multiple_pending_signals_sequential	PASS	
+munmap_segv	PASS	
+munmap_discontinuous	PASS	
+nanosleep	PASS	
+netfilter	PASS	
+netfilter_ipv6	PASS	
+netlink_mmap_disable	PASS	
+no_mask_timeslice	PASS	
+nscd	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/nscd.c:13: !(ret < 0 && errno == EACCES) errno:0 (Success)"
+numa	PASS	
+old_fork	PASS	
+openat2	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 228: |   expected: T1   -> ? = 0 @53265:0x7ffff7d1b39b |   actual:   T1   -> ? = -17 @53265:0x7ffff7d1b39b
+openat_null	PASS	
+open_tree	PASS	
+orphan_process	PASS	
+packet_mmap_disable	PASS	
+patch_syscall_restart	PASS	
+pause	PASS	
+perf_event	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/perf_event.c:32: !(errno == EACCES) errno:38 (Function not implemented)"
+perf_event_ioctl	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/perf_event_ioctl.c:35: !(fd >= 0) errno:38 (Function not implemented)"
+perf_event_mmap	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/perf_event_mmap.c:25: !(0 <= counter_fd) errno:38 (Function not implemented)"
+personality	PASS	
+pid_ns_kill_child	PASS	
+pid_ns_kill_child_threads	PASS	
+pid_ns_kill_child_zombie	PASS	
+pid_ns_kill_threads	REC_DEADLOCK	[ffs] DEADLOCK: no thread can make progress (blocked: [1, 3])
+pid_ns_kill_threads_exit_wait	PASS	
+pid_ns_reap	PASS	
+pid_ns_segv	PASS	
+pid_ns_shutdown	REC_TIMEOUT	
+pidfd	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/pidfd.c:49: !(ret == 0) errno:10 (No child processes)"
+pidfd_getfd	PASS	
+pkeys	PASS	
+poll_sig_race	PASS	
+ppoll	PASS	
+ppoll_deliver	PASS	
+prctl	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/prctl.c:52: !(tsc == PR_TSC_ENABLE) errno:22 (Invalid argument)"
+prctl_anon_vma_name	PASS	
+prctl_auxv	PASS	
+prctl_caps	PASS	
+prctl_deathsig	PASS	
+prctl_mdwe	PASS	
+prctl_name	PASS	
+prctl_short_name	PASS	
+prctl_speculation_ctrl	PASS	
+prctl_syscall_user_dispatch	REC_NOTOKEN	exit=0 last="Not running under rr apparently"
+privileged_net_ioctl	PASS	
+proc_fds	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 231: |   expected: T1   -> fstat = 0 @54533:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @54533:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+proc_mem	PASS	
+protect_rr_fds	PASS	
+prw	PASS	
+pthread_condvar_locking	PASS	
+pthread_mutex_timedlock	PASS	
+pthread_pi_mutex	PASS	
+pthread_rwlocks	PASS	
+ptrace	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/x86/ptrace.c:130: !(0 == ptrace(PTRACE_SEIZE, child, NULL, NULL)) errno:1 (Operat"
+ptrace_attach_null_status	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_attach_null_status.c:15: !(0 == ptrace(PTRACE_ATTACH, child, NULL, NULL)) "
+ptrace_attach_running	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_attach_running.c:18: !(0 == ptrace(PTRACE_ATTACH, child, NULL, NULL)) errn"
+ptrace_attach_sleeping	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_attach_sleeping.c:16: !(0 == ptrace(PTRACE_ATTACH, child, NULL, NULL)) err"
+ptrace_attach_stopped	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_attach_stopped.c:16: !(0 == ptrace(PTRACE_ATTACH, child, NULL, NULL)) errn"
+ptrace_attach_syscall	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_attach_syscall.c:22: !(0 == ptrace(PTRACE_ATTACH, child, NULL, NULL)) errn"
+ptrace_attach_thread_running	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_attach_thread_running.c:44: !(0 == ptrace(PTRACE_ATTACH, child, NULL, NULL"
+ptrace_breakpoint	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_breakpoint.c:41: !(0 == ptrace(PTRACE_ATTACH, child, NULL, (void*)0)) errn"
+ptrace_change_patched_syscall	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_change_patched_syscall.c:33: !(0 == ptrace(PTRACE_SEIZE, child, NULL, (voi"
+ptrace_debug_regs	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/x86/ptrace_debug_regs.c:28: !(0 == ptrace(PTRACE_ATTACH, child, NULL, NULL)) errn"
+ptrace_exec	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_exec.c:61: !(0 == ptrace(PTRACE_ATTACH, child, NULL, (void*)PTRACE_O_TRACE"
+ptrace_exec32	PASS	
+ptrace_group_stop	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_group_stop.c:47: !(0 == ptrace(PTRACE_SEIZE, child2, 0, 0)) errno:1 (Opera"
+ptrace_kill_grandtracee	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_kill_grandtracee.c:29: !(0 == ptrace(PTRACE_SEIZE, child, NULL, (void*)PTR"
+ptrace_tls	REC_DEADLOCK	[ffs] DEADLOCK: no thread can make progress (blocked: [1])
+ptrace_seize	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_seize.c:27: !(0 == ptrace(PTRACE_SEIZE, child, NULL, (void*)PTRACE_O_TRACE"
+ptrace_sigchld	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_sigchld.c:35: !(0 == ptrace(PTRACE_SEIZE, child1, NULL, NULL)) errno:1 (Op"
+ptrace_sigchld_blocked	PASS	
+ptrace_signals	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_signals.c:36: !(0 == ptrace(PTRACE_ATTACH, child, NULL, NULL)) errno:1 (Op"
+ptrace_singlestep	REC_DEADLOCK	[ffs] DEADLOCK: no thread can make progress (blocked: [1])
+ptrace_syscall	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_syscall.c:31: !(0 == ptrace(PTRACE_SEIZE, child, NULL, (void*)PTRACE_O_TRA"
+ptrace_syscall_clone_untraced	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_syscall_clone_untraced.c:22: !(0 == ptrace(PTRACE_SEIZE, child, NULL, (voi"
+ptrace_sysemu	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/x86/ptrace_sysemu.c:84: !(0 == ptrace(PTRACE_SEIZE, child, NULL, (void*)PTRACE_O_"
+ptrace_sysemu_syscall	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_sysemu_syscall.c:49: !(WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) "
+ptrace_trace_clone	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_trace_clone.c:42: !(0 == ptrace(PTRACE_SEIZE, child, NULL, (void*)(PTRACE_"
+ptrace_trace_exit	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_trace_exit.c:21: !(0 == ptrace(PTRACE_SEIZE, child, NULL, (void*)(PTRACE_O"
+ptrace_traceme	REC_DEADLOCK	[ffs] DEADLOCK: no thread can make progress (blocked: [1])
+ptrace_traceme_thread	REC_DEADLOCK	[ffs] DEADLOCK: no thread can make progress (blocked: [1, 2])
+ptrace_waiter_thread	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptrace_waiter_thread.c:31: !(0 == ptrace(PTRACE_ATTACH, child, NULL, NULL)) errno"
+ptracer_death	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptracer_death.c:48: !(WIFEXITED(status) && WEXITSTATUS(status) == 44) errno:0 (Su"
+ptracer_death_multithread	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptracer_death_multithread.c:108: !(WIFEXITED(status) && WEXITSTATUS(status) == 44"
+ptracer_death_multithread_peer	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/ptracer_death_multithread_peer.c:113: !(WIFEXITED(status) && WEXITSTATUS(status) "
+quotactl	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 251: |   expected: T1   -> fstat = 0 @54579:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @54579:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+rdtsc	PASS	
+rdtsc_flags	PASS	
+read_nothing	PASS	
+readdir	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 233: |   expected: T1   -> fstat = 0 @53028:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @53028:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+read_large	PASS	
+read_oversize	PASS	
+readlink	PASS	
+readlinkat	PASS	
+readv	PASS	
+record_replay_subject	PASS	
+recvfrom	PASS	
+redzone_integrity	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/redzone_integrity.c:73: !(did_sighandler_test) errno:4 (Interrupted system call)"
+rename	PASS	
+rlimit	PASS	
+rseq_cpu_id_reset	PASS	
+rusage	PASS	
+samask	PASS	
+save_data_fd	PASS	
+sched_attr	PASS	
+sched_setaffinity	PASS	
+sched_setparam	PASS	
+sched_yield	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/sched_yield.c:38: !("pong thread: " && PING == last) errno:0 (Success)"
+sched_yield_to_lower_priority	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/sched_yield_to_lower_priority.c:19: !(!low_priority_thread_scheduled) errno:0 (Su"
+scm_rights	PASS	
+scratch_read	PASS	
+seccomp	PASS	
+seccomp_cloning	PASS	
+seccomp_clone_fail	PASS	
+seccomp_desched	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 240: |   expected: T1   -> ? = 0 @54017:0x7ffff7d1c3bb |   actual:   T1   -> ? = 0 @54017:0x7ffff7d1c3bb (syscall output bytes or addresses differ)
+seccomp_kill_exit	PASS	
+seccomp_madvise	PASS	
+seccomp_null	PASS	
+seccomp_sigsys_args	PASS	
+seccomp_sigsys_sigtrap	PASS	
+seccomp_sigsys_syscallbuf	PASS	
+seccomp_tsync	PASS	
+seccomp_veto_exec	PASS	
+self_shebang	PASS	
+self_sigint	PASS	
+sem	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 230: |   expected: T1   -> ? = 18 @54517:0x7ffff7d2f2fb |   actual:   T1   -> ? = 19 @54517:0x7ffff7d2f2fb
+send_block	PASS	
+sendfile	PASS	
+set_ptracer	PASS	
+set_thread_area	REC_ERROR	[ffs] error: unsupported syscall ABI: arch 0x40000003, syscall 243; ffs requires native x86-64
+set_tid_address	PASS	
+setgid	PASS	
+setgroups	PASS	
+setsid	PASS	
+shared_exec	PASS	
+shared_monitor	PASS	
+shared_offset	PASS	
+shared_write	PASS	
+shm	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 231: |   expected: T1   -> ? = 35 @54413:0x7ffff7d2f4de |   actual:   T1   -> ? = 37 @54413:0x7ffff7d2f4de
+shm_unmap	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 225: |   expected: T1   -> ? = 36 @53370:0x7ffff7d2f4de |   actual:   T1   -> ? = 38 @53370:0x7ffff7d2f4de
+sigaction_old	PASS	
+sigaltstack	PASS	
+sigchld_interrupt_signal	PASS	
+sigcont	PASS	
+sigcont_threaded	PASS	
+sigframe_grow_stack	PASS	
+sighandler_bad_rsp_sigsegv	PASS	
+sighandler_fork	PASS	
+sighandler_mask	PASS	
+sigill	PASS	
+signal_deferred	PASS	
+signal_during_preload_init	PASS	
+signal_frame	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/signal_frame.c:31: !(fd >= 0) errno:2 (No such file or directory)"
+signal_unstoppable	PASS	
+signal_xmm_state	PASS	
+signalfd	PASS	
+sigprocmask	PASS	
+sigprocmask_ensure_delivery	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/sigprocmask_ensure_delivery.c:67: !(got_sig) errno:0 (Success)"
+sigprocmask_exec	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/sigprocmask_exec.c:17: !(sigismember(&set, SIGSEGV)) errno:0 (Success)"
+sigprocmask_evil	PASS	
+sigprocmask_in_syscallbuf_sighandler	PASS	
+sigprocmask_rr_sigs	PASS	
+sigprocmask_syscallbuf	PASS	
+sigpwr	PASS	
+sigqueueinfo	PASS	
+sigtrap_process_group	PASS	
+sigreturn	PASS	
+sigreturn_reg	PASS	
+sigreturnmask	PASS	
+sigrt	PASS	
+sigstop	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 252: |   expected: T2 exiting @20:0x7ffff7c42c1b |   actual:   T2 exited (137) @20:0x0
+sigstop2	PASS	
+sigsuspend	PASS	
+sigtrap	PASS	
+simple_threads_stress	PASS	
+sioc	STRICT_DIVERGED	[ffs] REPLAY DIVERGED at step 1045: |   expected: T1   -> write = 68 @84468:0x7ffff7d1cf00 |   actual:   T1   -> write = 67 @84467:0x7ffff7d1cf00
+small_holes	PASS	
+sock_name_null	PASS	
+sock_names_opts	PASS	
+spinlock_priorities	PASS	
+splice	PASS	
+stack_growth_after_syscallbuf	PASS	
+stack_growth_syscallbuf	PASS	
+stack_growth_with_guard	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/stack_growth_with_guard.c:41: !(got_segv) errno:0 (Success)"
+stack_invalid	PASS	
+stack_overflow	PASS	
+stack_overflow_altstack	PASS	
+stack_overflow_with_guard	PASS	
+statfs	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 254: |   expected: T1   -> ? = 0 @53901:0x7ffff7d1c3bb |   actual:   T1   -> ? = 0 @53901:0x7ffff7d1c3bb (syscall output bytes or addresses differ)
+statx	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 235: |   expected: T1   -> ? = 0 @53431:0x7ffff7d2966d |   actual:   T1   -> ? = 0 @53431:0x7ffff7d2966d (syscall output bytes or addresses differ)
+stdout_child	PASS	
+stdout_cloexec	PASS	
+stdout_dup	PASS	
+stdout_redirect	PASS	
+switch_read	PASS	
+symlink	PASS	
+sync	PASS	
+sync_file_range	PASS	
+syscall_bp	PASS	
+syscall_in_writable_mem	PASS	
+syscallbuf_signal_reset	PASS	
+syscallbuf_signal_blocking	PASS	
+syscallbuf_sigstop	PASS	
+syscallbuf_timeslice	PASS	
+syscallbuf_timeslice2	PASS	
+sysconf	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/sysconf.c:18: !(1 == ncpus) errno:0 (Success)"
+sysconf_conf	PASS	
+sysctl	PASS	
+sysemu_singlestep	PASS	
+sysfs	PASS	
+sysinfo	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 246: |   expected: T1   -> ? = 0 @53591:0x7ffff7d2d68b |   actual:   T1   -> ? = 0 @53591:0x7ffff7d2d68b (syscall output bytes or addresses differ)
+syslog	PASS	
+tgkill	PASS	
+thread_yield	PASS	
+timer	REC_TIMEOUT	
+timerfd	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/timerfd.c:11: !(fd >= 0) errno:38 (Function not implemented)"
+times	PASS	
+tpause	PASS	
+truncate_temp	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 240: |   expected: T1   -> newfstatat = 0 @54262:0x7ffff7d15d8e |   actual:   T1   -> newfstatat = 0 @54262:0x7ffff7d15d8e (syscall output bytes or addresses differ)
+tty_tostop	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/tty_tostop.c:43: !(WIFEXITED(status) && WEXITSTATUS(status) == 77) errno:0 (Succe"
+tun	PASS	
+two_signals_with_mask	PASS	
+ulimit_low	PASS	
+umwait	PASS	
+uname	PASS	
+unexpected_exit	PASS	
+unexpected_exit_execve	PASS	
+unexpected_exit_execve_twice	REC_NOTOKEN	exit=134 last="sending SIGKILL to 10002"
+unexpected_exit_pid_ns	PASS	
+unjoined_thread	PASS	
+unshare	PASS	
+userfaultfd	PASS	
+utimes	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 239: |   expected: T1   -> fstat = 0 @53531:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @53531:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+v4l_dmabuf	PASS	
+vdso_parts	PASS	
+vdso_symbols	PASS	
+vfork_done	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/vfork_done.c:18: !(0 == ptrace(PTRACE_SEIZE, pid, 0, opts)) errno:1 (Operation no"
+vfork_flush	PASS	
+vfork_setopts	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/vfork_setopts.c:7: !(0 == ptrace(PTRACE_ATTACH, pid, 0, 0)) errno:1 (Operation no"
+vfork_shared	PASS	
+video_capture	PASS	
+vm_readv_writev	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/vm_readv_writev.c:23: !(4 == ret) errno:38 (Function not implemented)"
+vsyscall	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 239: |   expected: T1   -> fstat = 0 @54537:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @54537:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+vsyscall_timeslice	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 238: |   expected: T1   -> fstat = 0 @53858:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @53858:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+x87env	STRICT_DIVERGED	[ffs] REPLAY DIVERGED at step 230: |   expected: T1   -> write = 8 @52908:0x7ffff7d1cf00 |   actual:   T1   -> write = 15 @52914:0x7ffff7d1cf00
+wait	PASS	
+wait_sigstop	PASS	
+write_race	PASS	
+writev	PASS	
+xattr	PASS	
+zero_length_read	PASS	
+abort_nonmain	PASS	
+args	PASS	
+async_kill_with_syscallbuf	PASS	
+async_kill_with_syscallbuf2	PASS	
+async_kill_with_threads	PASS	
+async_kill_with_threads_main_running	REPLAY_TIMEOUT	
+async_kill_with_threads_thread_running	REPLAY_TIMEOUT	
+async_segv	PASS	
+async_signal_syscalls	PASS	
+async_signal_syscalls2	PASS	
+async_signal_syscalls_siginfo	PASS	
+async_usr1	PASS	
+block_clone_interrupted	PASS	
+block_intr_sigchld	PASS	
+blocked_sigill	PASS	
+blocked_sigsegv	PASS	
+chaos_oom	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/chaos_oom.c:78: !(check_range_available(ptrs, i, map_size, ((uint64_t)4)*1024*102"
+checksum_sanity	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/checksum_sanity.c:91: !(end > 0) errno:9 (Bad file descriptor)"
+check_lost_interrupts	REPLAY_TIMEOUT	
+clone_file_range	PASS	
+clone_syscallbuf_cleanup_blocked	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/clone_syscallbuf_cleanup_blocked.c:25: !(expected == actual) errno:0 (Success)"
+clone_syscallbuf_cleanup_cpu	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/clone_syscallbuf_cleanup_cpu.c:27: !(expected == actual) errno:0 (Success)"
+clone_vfork	PASS	
+condvar_stress	PASS	
+context_switch_after_patch	PASS	
+crash	PASS	
+daemon_read	PASS	
+exclusion_region	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/exclusion_region.c:27: !(failed_to_allocate_in_some_region) errno:0 (Success)"
+exec_many	PASS	
+exec_shared_as	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/exec_shared_as.c:39: !(WIFEXITED(status) && WEXITSTATUS(status) == 77) errno:2 (N"
+exit_group	PASS	
+exit_race	PASS	
+fd_limit	PASS	
+fork_stress	PASS	
+fork_syscalls	PASS	
+getcwd	PASS	
+hello	PASS	
+hooks	PASS	
+ignored_async_usr1	PASS	
+ignored_sigsegv	PASS	
+int3_ok	REC_NOTOKEN	exit=133 last="doing int3 ..."
+intr_ptrace_decline	REC_NOTOKEN	exit=138 last="M: killing reader ..."
+link	PASS	
+madvise_fracture_flags	REPLAY_DIVERGED	[ffs] REPLAY DIVERGED at step 233: |   expected: T1   -> fstat = 0 @53603:0x7ffff7d15d4b |   actual:   T1   -> fstat = 0 @53603:0x7ffff7d15d4b (syscall output bytes or addresses differ)
+mmap_shared_write_exec_race	PASS	
+mmap_tmpfs	PASS	
+mmap_write_private	PASS	
+mprotect_growsdown	PASS	
+mprotect_syscallbuf_overflow	PASS	
+mutex_pi_stress	PASS	
+overflow_branch_counter	PASS	
+patch_page_end	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/patch_page_end.c:48: !(p[0] == 0xe9) errno:0 (Success)"
+patch_40_80_f6_81	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/x86/patch_40_80_f6_81.c:16: !(p[0] == 0xe9) errno:0 (Success)"
+patch_pc_rel	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/x86/patch_pc_rel.c:20: !(p[8] == 0xe9) errno:0 (Success)"
+prctl_tsc	REC_NOTOKEN	exit=1 last="(no output)"
+priority	PASS	
+rdtsc_loop	PASS	
+rdtsc_loop2	PASS	
+rdtsc_interfering	PASS	
+rseq_syscallbuf	PASS	
+seccomp_signals	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/seccomp_signals.c:35: !(ret == 0) errno:13 (Permission denied)"
+segfault	PASS	
+setuid	PASS	
+shared_map	PASS	
+sigprocmask_race	PASS	
+sigprocmask_rr_sigs_nondefault	PASS	
+simple	PASS	
+strict_priorities	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/strict_priorities.c:17: !(main_thread_done) errno:0 (Success)"
+string_instructions	PASS	
+string_instructions_async_signals	PASS	
+string_instructions_async_signals_shared	PASS	
+syscallbuf_branch_check	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/x86/syscallbuf_branch_check.c:175: !(p[0] == 0xe9) errno:0 (Success)"
+syscallbuf_signal_blocking_read	PASS	
+syscallbuf_rdtsc_page	PASS	
+sysconf_onln	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/sysconf_onln.c:16: !(ncpus == atoi(argv[1]+sizeof(arg)-1) || ncpus == 1) errno:0 "
+term_nonmain	PASS	
+thread_open_race	PASS	
+thread_stress	PASS	
+threads	PASS	
+tracee_unmap_vdso	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/tracee_unmap_vdso.c:17: !(WIFEXITED(status)) errno:0 (Success)"
+user_ignore_sig	REC_NOTOKEN	exit=134 last="FAILED at /home/aoli/repos/rr/src/test/user_ignore_sig.c:6: !("Shouldn't have caught SIGUSR1" && 0) errno:0 (Success)"
+exit_fast	BUILD_FAIL	collect2: error: ld returned 1 exit status

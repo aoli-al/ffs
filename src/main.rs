@@ -6,6 +6,7 @@
 //! forking the (stopped) tracee.
 
 mod checkpoint;
+mod effects;
 mod explore;
 mod fdpass;
 mod ffs_api;
@@ -66,7 +67,8 @@ struct CommonOpts {
     block_grace_us: u64,
     /// Milliseconds of real time a thread may run user code without any
     /// scheduling event before it is preempted regardless of ticks (a loop
-    /// without conditional branches never reaches a tick budget).
+    /// without conditional branches never reaches a tick budget). Zero disables
+    /// this host-time scheduling source; branchless loops may then run forever.
     #[arg(long, default_value_t = 100)]
     slice_cap_ms: u64,
     /// Print every scheduling step.
@@ -157,9 +159,15 @@ enum Cmd {
         common: CommonOpts,
         /// Trace to replay.
         trace: PathBuf,
-        /// Compare syscall return values too.
-        #[arg(long)]
+        /// Accepted for compatibility: return values are checked by default.
+        #[arg(long, conflicts_with = "lenient")]
         strict: bool,
+        /// Ignore syscall return-value differences (legacy traces only).
+        #[arg(long)]
+        lenient: bool,
+        /// Also compare captured syscall output buffers (coverage is partial).
+        #[arg(long)]
+        verify_outputs: bool,
         /// Command to run (defaults to the one in the trace).
         #[arg(last = true)]
         argv: Vec<String>,
@@ -336,6 +344,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                 Some(policy.seed),
             );
             trace.virtual_random = opts.virtual_random;
+            trace.capture_execution(&session);
             let outcome = sched::drive(
                 &mut session,
                 pol.as_mut(),
@@ -354,7 +363,9 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Replay {
             common,
             trace,
-            strict,
+            strict: _,
+            lenient,
+            verify_outputs,
             argv,
         } => {
             let recorded = Trace::load(&trace)?;
@@ -363,15 +374,26 @@ fn real_main(cli: Cli) -> Result<i32> {
             } else {
                 argv
             };
-            let pmu = pmu_for(&common.ticks)?;
+            let ticks = recorded.execution.as_ref().map(|c| c.ticks.as_str()).unwrap_or(&common.ticks);
+            let pmu = pmu_for(ticks)?;
+            if recorded.version >= 2 && recorded.pmu != pmu.name {
+                bail!("trace requires PMU {}, current PMU is {}", recorded.pmu, pmu.name);
+            }
             let mut opts = session_opts(&common, recorded.seed.unwrap_or(0));
+            if recorded.execution.as_ref().is_some_and(|c| c.pid_namespace) && opts.ns.is_none() {
+                bail!("trace requires a private PID namespace; cannot replay with unstable ids");
+            }
             opts.virtual_time = recorded.virtual_time;
             opts.virtual_random = recorded.virtual_random;
             recorded.apply_env(&mut opts);
+            if lenient && recorded.version >= 2 {
+                bail!("--lenient is only supported for legacy v1 traces");
+            }
             let mut session = Session::spawn(&argv, pmu.clone(), opts)?;
             session.replay = true;
             let mut pol = sched::Replay::new(&recorded);
-            pol.strict_ret = strict;
+            pol.strict_ret = !lenient;
+            pol.verify_outputs = verify_outputs;
             let mut out = Trace::new(
                 argv,
                 pmu.name.to_string(),
@@ -386,29 +408,28 @@ fn real_main(cli: Cli) -> Result<i32> {
                 &run_opts(&common, false),
                 None,
             )?;
-            if !matches!(outcome, Outcome::Divergence { .. })
-                && outcome != recorded.outcome
-                && outcome != Outcome::Bound
-            {
-                eprintln!(
-                    "[ffs] note: recorded outcome was {:?}, replay outcome is {:?}",
-                    recorded.outcome, outcome
-                );
+            if matches!(outcome, Outcome::Divergence { .. }) {
+                return Ok(report(&outcome));
             }
-            let complete = !matches!(outcome, Outcome::Divergence { .. })
-                && (pol.idx == recorded.steps.len() || pol.finished());
-            if complete {
-                eprintln!(
-                    "[ffs] replayed all {} steps identically",
-                    recorded.steps.len()
-                );
-            } else {
-                eprintln!(
-                    "[ffs] replayed {} of {} steps",
-                    pol.idx,
-                    recorded.steps.len()
-                );
+            let complete = pol.idx == recorded.steps.len()
+                || (pol.finished() && outcome == recorded.outcome && outcome != Outcome::Bound);
+            if !complete {
+                return Ok(report(&Outcome::Divergence {
+                    at: pol.idx,
+                    expected: format!("{} recorded steps", recorded.steps.len()),
+                    actual: format!("stopped after {} steps: {outcome:?}", pol.idx),
+                }));
             }
+            // Bound after consuming the trace is how Replay signals its end.
+            // A real terminal outcome must still match the recording.
+            if outcome != Outcome::Bound && outcome != recorded.outcome {
+                return Ok(report(&Outcome::Divergence {
+                    at: pol.idx,
+                    expected: format!("outcome {:?}", recorded.outcome),
+                    actual: format!("outcome {outcome:?}"),
+                }));
+            }
+            eprintln!("[ffs] replayed all {} steps with recorded checks", recorded.steps.len());
             if outcome == Outcome::Bound {
                 return Ok(0);
             }

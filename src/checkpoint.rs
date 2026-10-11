@@ -42,7 +42,6 @@ const CLONE_THREAD: u64 = 0x10000;
 const CLONE_SYSVSEM: u64 = 0x40000;
 const CLONE_SETTLS: u64 = 0x80000;
 const CLONE_CHILD_CLEARTID: u64 = 0x200000;
-const CLONE_CHILD_SETTID: u64 = 0x1000000;
 const PR_SET_NAME: u64 = 15;
 const PR_GET_TID_ADDRESS: u64 = 40;
 const SYS_RESTART_SYSCALL: u64 = 219;
@@ -65,6 +64,7 @@ struct ThreadState {
     unreported: bool,
     execs: u32,
     vdso_patched: bool,
+    tsc_mode: i32,
     rseq: Option<(u64, u64, u64)>,
     vblock: Option<VBlock>,
     vdeadline: Option<(u64, i64)>,
@@ -133,6 +133,7 @@ fn capture(task: &mut Task) -> Result<ThreadState> {
         unreported: task.unreported && !matches!(state, State::Stopped(Stop::Parked)),
         execs: task.execs,
         vdso_patched: task.vdso_patched,
+        tsc_mode: task.tsc_mode,
         rseq: task.rseq,
         vblock: task.vblock,
         vdeadline: task.vdeadline,
@@ -213,6 +214,7 @@ fn apply(task: &mut Task, st: &ThreadState, is_fork_child: bool) -> Result<()> {
     task.unreported = st.unreported;
     task.execs = st.execs;
     task.vdso_patched = st.vdso_patched;
+    task.tsc_mode = st.tsc_mode;
     task.rseq = st.rseq;
     task.in_syscall = false;
     Ok(())
@@ -800,6 +802,7 @@ impl Session {
         ctx.pids = pids.clone();
         collect_pipe_ends(&pids, &mut ctx);
         let mut new = Session {
+            cpu_online: self.cpu_online.clone(),
             tasks: BTreeMap::new(),
             ltids: BTreeMap::new(),
             next_ltid: self.next_ltid,
@@ -915,7 +918,13 @@ impl Session {
                         | CLONE_SYSVSEM
                         | CLONE_SETTLS;
                     if st.tid_address != 0 {
-                        flags |= CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+                        // Only CLEARTID: the word at the address already
+                        // holds what the original had (the memory is a
+                        // copy, the tid is canonical).  glibc 2.44 points
+                        // clear_child_tid at the thread's join state, and
+                        // SETTID would overwrite it with the tid, making a
+                        // joiner's futex wait fail with EAGAIN in the copy.
+                        flags |= CLONE_CHILD_CLEARTID;
                     }
                     let mut ret;
                     loop {

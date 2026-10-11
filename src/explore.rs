@@ -193,12 +193,13 @@ impl Explorer {
             .fork_session(true)
             .context("fork root for verification")?;
         let t = Trace {
-            version: 1,
+            version: 2,
             argv: self.argv.clone(),
             pmu: self.pmu.name.to_string(),
             virtual_time: self.prefix.virtual_time,
             virtual_random: self.prefix.virtual_random,
             seed: None,
+            execution: self.prefix.execution.clone(),
             env: self.prefix.env.clone(),
             cwd: self.prefix.cwd.clone(),
             steps: steps.to_vec(),
@@ -384,6 +385,7 @@ impl Explorer {
                         event: Event::Fork,
                         ticks: 0,
                         rip: 0,
+                        effects: None,
                     });
                 }
                 let mut budget =
@@ -535,12 +537,13 @@ impl Explorer {
                 .collect();
             if !replay_steps.is_empty() {
                 let t = Trace {
-                    version: 1,
+                    version: 2,
                     argv: self.argv.clone(),
                     pmu: self.pmu.name.to_string(),
                     virtual_time: self.prefix.virtual_time,
                     virtual_random: self.prefix.virtual_random,
                     seed: None,
+                    execution: self.prefix.execution.clone(),
                     env: self.prefix.env.clone(),
                     cwd: self.prefix.cwd.clone(),
                     steps: replay_steps.clone(),
@@ -613,6 +616,7 @@ pub fn explore(
         Some(params.seed),
     );
     prefix.virtual_random = session.opts.virtual_random;
+    prefix.capture_execution(&session);
     let root_kind = eopts.root.clone();
 
     // Phase 1: run to the root with a deterministic policy.
@@ -666,6 +670,7 @@ pub fn explore(
         event: Event::Fork,
         ticks: 0,
         rip: 0,
+        effects: None,
     });
     session.kill_all();
     drop(session);

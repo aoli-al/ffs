@@ -131,6 +131,7 @@ pub struct VirtualClock {
 }
 
 pub struct Session {
+    pub cpu_online: Option<Rc<CpuOnline>>,
     pub tasks: BTreeMap<pid_t, Task>,
     pub ltids: BTreeMap<Ltid, pid_t>,
     pub next_ltid: Ltid,
@@ -194,6 +195,9 @@ pub struct Session {
 }
 
 const CLOCK_GETTIME: u64 = 228;
+const RESTART_SYSCALL: u64 = 219;
+/// `si_code` of a SIGTRAP caused by the trap flag.
+const TRAP_TRACE: i32 = 2;
 const FORK: u64 = 57;
 const VFORK: u64 = 58;
 const GETTIMEOFDAY: u64 = 96;
@@ -329,6 +333,7 @@ impl Session {
 
         let vrandom = VirtualRandom::new(opts.seed);
         let mut session = Session {
+            cpu_online: None,
             tasks: BTreeMap::new(),
             ltids: BTreeMap::new(),
             next_ltid: 1,
@@ -506,6 +511,7 @@ impl Session {
         let mut t = Task::new(child, tgid, ltid, &self.pmu)?;
         let parent_task = self.task(parent)?;
         t.vdso_patched = parent_task.vdso_patched;
+        t.tsc_mode = parent_task.tsc_mode;
         if initial.is_none() {
             t.state = State::Exited;
         }
@@ -565,7 +571,8 @@ impl Session {
                     None => WaitOutcome::Exited,
                 });
             }
-            if !allow_block && !self.replay && started.elapsed() >= self.opts.slice_cap {
+            if !allow_block && !self.task(tid)?.in_syscall && !self.replay
+                && !self.opts.slice_cap.is_zero() && started.elapsed() >= self.opts.slice_cap {
                 // User code without ticks (a loop of unconditional jumps):
                 // interrupt it and make that a preemption, which a replay
                 // reaches by breakpoint like any other.
@@ -860,7 +867,7 @@ impl Session {
             let mut budget = budget;
             match stop {
                 Stop::SyscallEntry { nr } => {
-                    allow_block = true;
+                    allow_block = crate::effects::may_block(self.task_mut(tid)?, nr)?;
                     budget = 0;
                     self.pre_syscall(tid, nr)?;
                 }
@@ -935,6 +942,15 @@ impl Session {
                     // Re-entry of a syscall the kernel restarted after the
                     // preemption signal interrupted it: not a new event.
                     t.restarting = false;
+                    // Preserve a stripped virtual deadline on re-entry.
+                    t.rewound = true;
+                    if nr == RESTART_SYSCALL {
+                        // A timed wait (poll, nanosleep, futex with a
+                        // timeout) is restarted through restart_syscall;
+                        // the exit still belongs to the original call.
+                        let orig = t.syscall_nr;
+                        t.state = State::Stopped(Stop::SyscallEntry { nr: orig });
+                    }
                     return Ok(None);
                 }
                 if let Some(call) = ffs_api::decode(nr) {
@@ -945,6 +961,22 @@ impl Session {
             Stop::SyscallExit { nr, .. } if self.task(tid)?.emulated.is_some() => {
                 let em = self.task_mut(tid)?.emulated.take().unwrap();
                 Ok(Some(self.vt_emulated_exit(tid, nr, em)?))
+            }
+            Stop::SyscallExit { ret, .. }
+                if ret == -(libc::EINTR as i64)
+                    && ptrace::pending_signals(tid) & (1u64 << (TIME_SLICE_SIGNAL - 1)) != 0
+                    && ptrace::interrupting_signals(tid) == 0 =>
+            {
+                // A late PMU overflow can arrive after syscall entry.
+                // Non-restartable waits (notably epoll) return EINTR for
+                // it. Make the kernel restart after we suppress our signal,
+                // rather than exposing an interruption from the tracer.
+                let t = self.task_mut(tid)?;
+                let mut r = t.regs()?;
+                r.rax = (-512i64) as u64; // ERESTARTSYS
+                t.set_regs(&r)?;
+                t.restarting = true;
+                Ok(None)
             }
             Stop::SyscallExit { nr, ret } if ptrace::is_restart_result(ret as u64) => {
                 // Interrupted by a signal; the kernel will restart it once the
@@ -1043,6 +1075,23 @@ impl Session {
                 if sig == libc::SIGSEGV && self.opts.virtual_time && self.try_emulate_rdtsc(tid)? {
                     return Ok(None);
                 }
+                if sig == libc::SIGTRAP {
+                    // A trap-flag trap the tracer did not ask for: the
+                    // trap flag leaked into the program (see
+                    // `Task::after_single_step`).  Clear it and carry on.
+                    let t = self.task_mut(tid)?;
+                    let mut r = t.regs()?;
+                    if r.eflags & crate::task::X86_TF != 0
+                        && ptrace::get_siginfo(tid).map(|i| ptrace::siginfo_code(&i) == TRAP_TRACE).unwrap_or(false)
+                    {
+                        log::debug!("task {tid}: spurious single-step trap at {:#x}, clearing TF", r.rip);
+                        r.eflags &= !crate::task::X86_TF;
+                        t.set_regs(&r)?;
+                        t.pending_sig = 0;
+                        t.state = State::Stopped(Stop::Parked);
+                        return Ok(None);
+                    }
+                }
                 if sig == libc::SIGTRAP && !self.watchpoints.is_empty() {
                     if let Ok(i) = ptrace::get_siginfo(tid) {
                         if ptrace::siginfo_code(&i) == crate::watch::TRAP_HWBKPT {
@@ -1127,6 +1176,22 @@ impl Session {
                 Ok(Some(Event::Signal { sig, info }))
             }
             Stop::CloneEvent { child, .. } => {
+                // Consult the application's flags, before our CLONE_PARENT
+                // rewrite, to preserve sibling creation in the logical tree.
+                let parent = self.task_mut(tid)?;
+                let r = parent.entry_regs.unwrap_or(parent.regs()?);
+                let sibling = match parent.syscall_nr {
+                    56 => r.rdi & libc::CLONE_PARENT as u64 != 0,
+                    435 => {
+                        let flags = match &parent.mem_restore {
+                            Some((addr, bytes)) if *addr == r.rdi && bytes.len() == 8 =>
+                                u64::from_ne_bytes(bytes.as_slice().try_into().unwrap()),
+                            _ => parent.mem.read_u64(r.rdi)?,
+                        };
+                        flags & libc::CLONE_PARENT as u64 != 0
+                    }
+                    _ => false,
+                };
                 let ltid = self.register_child(tid, child)?;
                 self.task_mut(tid)?.last_child = Some(ltid);
                 // fork/vfork were rewritten into clone with CLONE_PARENT:
@@ -1153,7 +1218,12 @@ impl Session {
                     // is a child of the forking process in the emulated tree.
                     let parent_key = self.proc_key(tid)?;
                     self.random_fork(parent_key, ltid);
-                    self.parent_of.insert(ltid, parent_key);
+                    let logical_parent = if sibling {
+                        self.parent_of.get(&parent_key).copied().unwrap_or(0)
+                    } else {
+                        parent_key
+                    };
+                    self.parent_of.insert(ltid, logical_parent);
                 }
                 Ok(None)
             }
@@ -1169,6 +1239,12 @@ impl Session {
     }
 
     fn pre_syscall(&mut self, _tid: pid_t, nr: u64) -> Result<()> {
+        // These interfaces permit writes outside traced syscall boundaries.
+        // Refuse setup/submission before they can create asynchronous state.
+        if crate::effects::refused_syscall(nr) {
+            self.emulate_syscall(_tid, Emulation::Ret(-(libc::ENOSYS as i64)))?;
+            return Ok(());
+        }
         const CLONE: u64 = 56;
         const FORK: u64 = 57;
         const VFORK: u64 = 58;
@@ -1190,6 +1266,22 @@ impl Session {
             return Ok(());
         }
         if self.opts.virtual_time {
+            if nr == PRCTL {
+                let t = self.task_mut(_tid)?;
+                let r = t.regs()?;
+                if r.rdi == libc::PR_SET_TSC as u64 && r.rsi == libc::PR_TSC_ENABLE as u64 {
+                    let mut n = r;
+                    n.rsi = libc::PR_TSC_SIGSEGV as u64;
+                    t.set_regs(&n)?;
+                    t.entry_regs = Some(r);
+                }
+            }
+            if matches!(nr, 283 | 286 | 287) {
+                // timerfd counters and poll readiness still use host time.
+                // Refuse until they have a virtual-clock implementation.
+                self.emulate_syscall(_tid, Emulation::Ret(-(libc::ENOSYS as i64)))?;
+                return Ok(());
+            }
             if nr == RSEQ {
                 // The kernel keeps the current cpu number in the rseq area,
                 // which would leak real scheduling into the program (e.g.
@@ -1220,8 +1312,8 @@ impl Session {
         let ptr = match nr {
             RT_SIGPROCMASK if r.rdi != SIG_UNBLOCK => r.rsi,
             RT_SIGSUSPEND => r.rdi,
-            PPOLL | EPOLL_PWAIT2 => r.r10,
-            EPOLL_PWAIT => r.r8,
+            PPOLL => r.r10,
+            EPOLL_PWAIT | EPOLL_PWAIT2 => r.r8,
             PSELECT6 if r.r9 != 0 => t.mem.read_u64(r.r9).unwrap_or(0),
             _ => return Ok(()),
         };
@@ -1247,7 +1339,6 @@ impl Session {
     fn cpu_file_pre_syscall(&mut self, tid: pid_t, nr: u64) -> Result<()> {
         const OPEN: u64 = 2;
         const OPENAT: u64 = 257;
-        static ONLINE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let t = self.task_mut(tid)?;
         let r = t.regs()?;
         let ptr = match nr {
@@ -1259,18 +1350,11 @@ impl Session {
         if path != "/sys/devices/system/cpu/online" {
             return Ok(());
         }
-        let file = ONLINE.get_or_init(|| {
-            // Must fit in the original path's buffer (30 bytes + NUL).
-            let p = std::env::temp_dir().join("ffs-cpu-online");
-            let p = p.to_str()?.to_string();
-            if p.len() > 30 {
-                return None;
-            }
-            std::fs::write(&p, "0\n").ok()?;
-            Some(p)
-        });
-        let Some(file) = file else { return Ok(()) };
-        let new = format!("{file}\0");
+        if self.cpu_online.is_none() {
+            self.cpu_online = Some(Rc::new(CpuOnline::new()?));
+        }
+        let new = format!("{}\0", self.cpu_online.as_ref().unwrap().0);
+        let t = self.task_mut(tid)?;
         let mut old = vec![0u8; new.len()];
         t.mem.read(ptr, &mut old)?;
         t.mem.write(ptr, new.as_bytes())?;
@@ -1326,6 +1410,12 @@ impl Session {
             return Ok(());
         }
         match nr {
+            PRCTL if r.rdi == libc::PR_GET_TSC as u64 => {
+                t.mem.write(r.rsi, &t.tsc_mode.to_ne_bytes())?;
+            }
+            PRCTL if r.rdi == libc::PR_SET_TSC as u64 => {
+                t.tsc_mode = r.rsi as i32;
+            }
             CLOCK_GETTIME => {
                 let ns = match r.rdi {
                     CLOCK_REALTIME => base_rt + now,
@@ -1413,6 +1503,9 @@ impl Session {
     fn try_emulate_rdtsc(&mut self, tid: pid_t) -> Result<bool> {
         let now = self.virtual_ns().wrapping_mul(3); // ~3 GHz TSC
         let t = self.task_mut(tid)?;
+        if t.tsc_mode == libc::PR_TSC_SIGSEGV {
+            return Ok(false);
+        }
         let mut r = t.regs()?;
         let mut insn = [0u8; 3];
         if t.mem.read(r.rip, &mut insn).is_err() {
@@ -1439,17 +1532,23 @@ impl Session {
     /// blocked here).
     pub fn resume_as_blocked(&mut self, ltid: Ltid) -> Result<Event> {
         let tid = self.tid_of(ltid)?;
+        if let Some(stop @ Stop::SyscallExit { ret, .. }) = self.task(tid)?.stop() {
+            if ret == -(libc::EINTR as i64) {
+                if let Some(event) = self.handle_stop(tid, stop)? {
+                    return Ok(event);
+                }
+            }
+        }
         let stop = self.task(tid)?.stop();
-        if let Some(Stop::SyscallExit { nr, ret }) = stop {
+        if let Some(Stop::SyscallExit { ret, .. }) = stop {
             if ptrace::is_restart_result(ret as u64) || self.task(tid)?.restarting {
                 // The kernel restarts the interrupted syscall on resume (its
                 // entry stop is invisible); the trace says it then blocks.
-                self.vclock.events += 1;
-                let t = self.task_mut(tid)?;
-                t.restarting = true;
-                t.resume(ResumeHow::Syscall, 0)?;
-                t.state = State::Blocked { nr };
-                return Ok(Event::Blocked { nr });
+                self.task_mut(tid)?.restarting = true;
+                // Drain the internal signal and restarted entry before
+                // claiming the task is back in the kernel. Otherwise the
+                // virtual clock could expire its wait at a signal stop.
+                return self.run_task(ltid, 0);
             }
         }
         let Some(Stop::SyscallEntry { nr }) = stop else {
@@ -1894,6 +1993,13 @@ impl Session {
                 libc::kill(*tgid, libc::SIGKILL);
             }
         }
+        // A task may already be held at an exit stop we consumed while
+        // finishing the main process. SIGKILL does not release that stop,
+        // and waitpid will not report it a second time.
+        for t in self.tasks.values_mut().filter(|t| t.is_alive() && t.is_ptrace_stopped()) {
+            let _ = t.hpc.stop();
+            let _ = ptrace::resume(t.tid, ResumeHow::Cont, 0);
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let mut pending = false;
@@ -1929,6 +2035,34 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.kill_all();
+    }
+}
+
+/// Keep the redirection short enough for the original pathname buffer,
+/// regardless of TMPDIR (Nix shells commonly use a much longer directory).
+/// mkstemp creates an exclusively owned file; checkpoints share its lifetime.
+pub struct CpuOnline(String);
+
+impl CpuOnline {
+    fn new() -> Result<Self> {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        let mut path = b"/tmp/ffs-cpu-XXXXXX\0".to_vec();
+        let fd = unsafe { libc::mkostemp(path.as_mut_ptr().cast(), libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        path.pop();
+        let result = Self(String::from_utf8(path)?);
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(b"0\n")?;
+        Ok(result)
+    }
+}
+
+impl Drop for CpuOnline {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 

@@ -25,7 +25,7 @@ statuses per test:
 | status | meaning |
 |---|---|
 | `PASS` | token printed, replay followed the trace, output identical, strict replay identical |
-| `STRICT_DIVERGED` | plain replay identical but a syscall return value differed |
+| `STRICT_DIVERGED` | the second replay diverged (same checks; `--strict` is now an alias) |
 | `OUTPUT_MISMATCH` | replay followed the schedule but printed something else |
 | `REPLAY_DIVERGED` | the replayed events differ from the trace |
 | `REPLAY_SHORT` / `REPLAY_ERROR` / `REPLAY_TIMEOUT` | replay ended early, ffs failed, or hung |
@@ -37,6 +37,18 @@ statuses per test:
 Per-test work directories (`out/work/<name>`) keep the binary, the trace
 and the stdout/stderr of each phase.  `--only a,b` restricts the run,
 `--ffs-args "..."` passes options such as `--real-time` to ffs.
+`--verify-outputs` adds output-buffer checking to both replay passes (not to
+recording):
+
+```
+nix-shell --run "python3 tests/rr/run.py --verify-outputs -j 8 --out /tmp/ffs-rr-verify"
+```
+
+ffs uses live shadow execution, so this suite can expose external-state
+mismatches as well as framework bugs. In particular, files left by recording
+and metadata for freshly created pipes can differ on replay. The historical
+baseline predates mandatory return checks; `--strict` is now a compatibility
+alias.
 
 rr is MIT licensed; the sources stay in the rr checkout and are built from
 there (`--rr`, default `~/repos/rr`).

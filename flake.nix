@@ -26,6 +26,8 @@
           perf
           gdb
           strace
+          jdk17
+          python3
         ];
       in
       {

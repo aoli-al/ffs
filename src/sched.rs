@@ -299,6 +299,7 @@ pub struct Replay {
     pub steps: Vec<Step>,
     pub idx: usize,
     pub strict_ret: bool,
+    pub verify_outputs: bool,
 }
 
 impl Replay {
@@ -306,7 +307,8 @@ impl Replay {
         Replay {
             steps: trace.steps.clone(),
             idx: 0,
-            strict_ret: false,
+            strict_ret: true,
+            verify_outputs: false,
         }
     }
 
@@ -430,7 +432,9 @@ impl Policy for Replay {
             }
             (a, b) => a == b,
         };
-        if !same || expected.ltid != step.ltid {
+        let effects_match = !self.verify_outputs
+            || expected.effects.as_ref().is_none_or(|e| step.effects.as_ref() == Some(e));
+        if !same || expected.ltid != step.ltid || !effects_match {
             return Ok(Some(Outcome::Divergence {
                 at: self.idx,
                 expected: format!(
@@ -441,11 +445,12 @@ impl Policy for Replay {
                     expected.rip
                 ),
                 actual: format!(
-                    "T{} {} @{}:{:#x}",
+                    "T{} {} @{}:{:#x}{}",
                     step.ltid,
                     describe(&step.event),
                     step.ticks,
-                    step.rip
+                    step.rip,
+                    if effects_match { "" } else { " (syscall output bytes or addresses differ)" }
                 ),
             }));
         }
@@ -539,6 +544,7 @@ pub fn perform(session: &mut Session, decision: &Decision) -> Result<Step> {
                 event: Event::Fork,
                 ticks: 0,
                 rip: 0,
+                effects: None,
             });
         }
         Decision::Stop(_) => unreachable!(),
@@ -548,11 +554,13 @@ pub fn perform(session: &mut Session, decision: &Decision) -> Result<Step> {
         let rip = if t.is_stopped() { t.rip() } else { 0 };
         (t.ticks, rip)
     };
+    let effects = crate::effects::capture(session, ltid, &event)?;
     Ok(Step {
         ltid,
         event,
         ticks,
         rip,
+        effects,
     })
 }
 

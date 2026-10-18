@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ptrace::Regs;
 use crate::session::{Event, Session};
-use crate::task::{Ltid, Task};
+use crate::task::{Ltid, Task, BlockClass};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Output {
@@ -189,46 +189,43 @@ pub fn capture(session: &mut Session, ltid: Ltid, event: &Event) -> Result<Optio
     Ok(Some(Effects { out }))
 }
 
-/// Disk latency in a synchronous syscall must not create a scheduling point.
-/// Unknown operations retain the existing blocking detection; this deliberately
-/// does not claim to emulate futex or external-I/O readiness.
-pub fn may_block(t: &mut Task, nr: u64) -> Result<bool> {
+/// Classify what syscall `nr` can block on (see `BlockClass`).  `peers`
+/// are the socket inodes of tracee-created socket pairs.
+pub fn block_class(t: &mut Task, nr: u64, peers: &std::collections::BTreeMap<u64, u64>) -> Result<BlockClass> {
+    const READ_LIKE: [u64; 8] = [0, 17, 19, 45, 47, 295, 299, 327];
+    const WRITE_LIKE: [u64; 8] = [1, 18, 20, 44, 46, 296, 307, 328];
     if metadata_query(nr)
         || matches!(
             nr,
-            3 | 8
-                | 9
-                | 10
-                | 11
-                | 12
-                | 24
-                | 32
-                | 33
-                | 39
-                | 102
-                | 104
-                | 107
-                | 108
-                | 186
-                | 218
-                | 228
-                | 229
-                | 273
-                | 292
-                | 318
-                | 334
+            3 | 8 | 9 | 10 | 11 | 12 | 24 | 32 | 33 | 39 | 102 | 104 | 107 | 108 | 186 | 218 | 228 | 229 | 273 | 292 | 318 | 334
         )
     {
-        return Ok(false);
+        return Ok(BlockClass::Never);
     }
+    // Waits that only another tracee or a (virtual) timer can end.
     if matches!(
         nr,
-        0 | 1 | 17 | 18 | 19 | 20 | 78 | 217 | 295 | 296 | 327 | 328
+        7 | 23 | 34 | 43 | 61 | 65 | 70 | 73 | 128 | 130 | 202 | 220 | 232 | 242 | 243 | 247 | 270 | 271 | 281 | 288 | 441 | 449
     ) {
-        let fd = t.regs()?.rdi;
-        return Ok(!std::fs::metadata(format!("/proc/{}/fd/{fd}", t.tid))
-            .map(|m| m.is_file())
-            .unwrap_or(false));
+        return Ok(BlockClass::Tracee);
     }
-    Ok(true)
+    if READ_LIKE.contains(&nr) || WRITE_LIKE.contains(&nr) {
+        let fd = t.regs()?.rdi;
+        let link = std::fs::read_link(format!("/proc/{}/fd/{fd}", t.tid)).ok();
+        let Some(link) = link else { return Ok(BlockClass::External) };
+        let l = link.to_string_lossy();
+        if l.starts_with("pipe:") || l.starts_with("anon_inode:[eventfd]") || l.starts_with("anon_inode:[timerfd]")
+            || l.starts_with("anon_inode:[signalfd]")
+        {
+            return Ok(BlockClass::Tracee);
+        }
+        if let Some(ino) = l.strip_prefix("socket:[").and_then(|r| r.strip_suffix(']')).and_then(|n| n.parse::<u64>().ok()) {
+            return Ok(if peers.contains_key(&ino) { BlockClass::Tracee } else { BlockClass::External });
+        }
+        if std::fs::metadata(format!("/proc/{}/fd/{fd}", t.tid)).map(|m| m.is_file()).unwrap_or(false) {
+            return Ok(BlockClass::Never);
+        }
+        return Ok(BlockClass::External);
+    }
+    Ok(BlockClass::External)
 }

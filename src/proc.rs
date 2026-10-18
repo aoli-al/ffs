@@ -12,6 +12,7 @@
 
 use anyhow::Result;
 use libc::pid_t;
+use std::time::{Duration, Instant};
 
 use crate::ptrace;
 use crate::remote::{self, Remote};
@@ -23,6 +24,9 @@ const CLONE: u64 = 56;
 const FORK: u64 = 57;
 const VFORK: u64 = 58;
 const WAIT4: u64 = 61;
+const KILL: u64 = 62;
+const EVENTFD2: u64 = 290;
+const PIDFD_OPEN: u64 = 434;
 const GETPPID: u64 = 110;
 const WAITID: u64 = 247;
 const CLONE3: u64 = 435;
@@ -188,7 +192,46 @@ impl Session {
                 };
                 self.emulate_syscall(tid, Emulation::Ret(ppid as i64))?;
             }
+            KILL => {
+                // A child the tracer has reaped but the tracee has not: the
+                // kernel would still accept a signal to the zombie (and do
+                // nothing), while the real pid is gone.
+                let pid = r.rdi as i32;
+                if pid > 0 {
+                    if let Some(l) = self.ltid_of_tracee_pid(pid) {
+                        if self.vzombies.iter().any(|z| z.key == l) {
+                            let sig = r.rsi as i32;
+                            let ret = if (0..=64).contains(&sig) { 0 } else { -(libc::EINVAL as i64) };
+                            self.emulate_syscall(tid, Emulation::Ret(ret))?;
+                        }
+                    }
+                }
+            }
+            PIDFD_OPEN => {
+                // Same situation: a pidfd of a reaped child cannot be made.
+                // Stand in an eventfd that is readable at once, which is
+                // what polling the pidfd of a zombie reports (tokio's
+                // process reaper polls, then calls waitpid).
+                let pid = r.rdi as i32;
+                if let Some(l) = self.ltid_of_tracee_pid(pid) {
+                    self.catch_up_exits(&[l])?;
+                    if self.vzombies.iter().any(|z| z.key == l) {
+                        let t = self.task_mut(tid)?;
+                        let mut n = r;
+                        n.orig_rax = EVENTFD2;
+                        n.rdi = 1;
+                        n.rsi = libc::EFD_CLOEXEC as u64 | (r.rsi & libc::O_NONBLOCK as u64);
+                        t.set_regs(&n)?;
+                        if t.entry_regs.is_none() {
+                            t.entry_regs = Some(r);
+                        }
+                    }
+                }
+            }
             WAIT4 | WAITID => {
+                let children: Vec<Ltid> = self.parent_of.iter().filter(|(_, p)| **p == key).map(|(c, _)| *c).collect();
+                self.catch_up_exits(&children)?;
+                let r = self.task_mut(tid)?.regs()?;
                 let vw = match nr {
                     WAIT4 => {
                         let pid = r.rdi as i32;
@@ -270,6 +313,31 @@ impl Session {
             _ => {}
         }
         Ok(())
+    }
+
+    /// A process past its exit event is dead or dying in the kernel: its
+    /// pidfd polls readable and a real `waitpid` would find it, while the
+    /// tracer may not have collected its status yet.  Catch up before
+    /// answering a wait or a `pidfd_open`, so that the emulated process
+    /// tree agrees with what the kernel has shown the tracee.
+    fn catch_up_exits(&mut self, procs: &[Ltid]) -> Result<()> {
+        ptrace::drain_statuses()?;
+        self.reap_zombies();
+        let dying: Vec<pid_t> = procs
+            .iter()
+            .filter(|k| !self.exited_procs.contains(k))
+            .filter_map(|k| self.ltids.get(k).copied())
+            .filter(|leader| self.zombies.contains(leader) && !self.tasks.values().any(|t| t.tgid == *leader && t.is_alive()))
+            .collect();
+        if !dying.is_empty() {
+            let start = Instant::now();
+            while dying.iter().any(|l| self.zombies.contains(l)) && start.elapsed() < Duration::from_millis(500) {
+                std::thread::sleep(Duration::from_micros(50));
+                ptrace::drain_statuses()?;
+                self.reap_zombies();
+            }
+        }
+        self.proc_check_exits()
     }
 
     fn child_matches(&self, child: Ltid, sel: &WaitSel, zombie_pgid: Option<pid_t>) -> bool {
@@ -501,8 +569,13 @@ impl Session {
         if pending == 0 {
             return Ok(());
         }
+        if pending & (1u64 << (libc::SIGKILL - 1)) != 0 {
+            // Nothing to ask the tracee: it dies as soon as it runs.
+            self.task_mut(tid)?.vwait = None;
+            return self.vt_wake(tid, -(libc::EINTR as i64));
+        }
         let sig = pending.trailing_zeros() as i32 + 1;
-        let (handler, flags) = {
+        let queried: Result<(u64, u64)> = (|| {
             let t = self.task_mut(tid)?;
             let mut r = Remote::new(t)?;
             let old = r.alloc_scratch(32)?;
@@ -510,7 +583,17 @@ impl Session {
             let handler = r.task.mem.read_u64(old)?;
             let flags = r.task.mem.read_u64(old + 8)?;
             r.restore()?;
-            (handler, flags)
+            Ok((handler, flags))
+        })();
+        let (handler, flags) = match queried {
+            Ok(v) => v,
+            Err(e) if e.is::<remote::TaskDied>() => {
+                let t = self.task_mut(tid)?;
+                t.vwait = None;
+                t.vblock = None;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         };
         let has_handler = handler > 1;
         if has_handler && flags & SA_RESTART == 0 {

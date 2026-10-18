@@ -1,0 +1,106 @@
+# name	cwd	ffs options	command
+ck_fifo_spsc	/home/aoli/repos/cprog-src/ck/regressions/ck_fifo/validate	--iterations 20	./ck_fifo_spsc 4 1 4000
+ck_fifo_mpmc	/home/aoli/repos/cprog-src/ck/regressions/ck_fifo/validate	--iterations 20	./ck_fifo_mpmc 4 1 2000
+ck_fifo_spsc_iter	/home/aoli/repos/cprog-src/ck/regressions/ck_fifo/validate	--iterations 20	./ck_fifo_spsc_iterator
+ck_fifo_mpmc_iter	/home/aoli/repos/cprog-src/ck/regressions/ck_fifo/validate	--iterations 20	./ck_fifo_mpmc_iterator
+ck_ring_spsc	/home/aoli/repos/cprog-src/ck/regressions/ck_ring/validate	--iterations 20	./ck_ring_spsc 4 1 256
+ck_ring_spmc	/home/aoli/repos/cprog-src/ck/regressions/ck_ring/validate	--iterations 20	./ck_ring_spmc 4 1 256
+ck_ring_mpmc	/home/aoli/repos/cprog-src/ck/regressions/ck_ring/validate	--iterations 20	./ck_ring_mpmc 4 1 256
+ck_ring_spmc_tpl	/home/aoli/repos/cprog-src/ck/regressions/ck_ring/validate	--iterations 20	./ck_ring_spmc_template 4 1 256
+ck_ring_mpmc_tpl	/home/aoli/repos/cprog-src/ck/regressions/ck_ring/validate	--iterations 20	./ck_ring_mpmc_template 4 1 256
+ck_hp_stack	/home/aoli/repos/cprog-src/ck/regressions/ck_hp/validate	--iterations 20	./ck_hp_stack 2 64 1
+ck_hp_fifo	/home/aoli/repos/cprog-src/ck/regressions/ck_hp/validate	--iterations 20	./ck_hp_fifo 2 1 1024 100
+ck_hp_nbds	/home/aoli/repos/cprog-src/ck/regressions/ck_hp/validate	--iterations 20	./nbds_haz_test 2 15 1
+ck_hp_fifo_donner	/home/aoli/repos/cprog-src/ck/regressions/ck_hp/validate	--iterations 20	./ck_hp_fifo_donner 2 2048
+ck_epoch_stack	/home/aoli/repos/cprog-src/ck/regressions/ck_epoch/validate	--iterations 20	./ck_stack 4 1
+ck_epoch_synchronize	/home/aoli/repos/cprog-src/ck/regressions/ck_epoch/validate	--iterations 20	./ck_epoch_synchronize 2 2 1
+ck_epoch_poll	/home/aoli/repos/cprog-src/ck/regressions/ck_epoch/validate	--iterations 20	./ck_epoch_poll 4 1 1
+ck_epoch_section	/home/aoli/repos/cprog-src/ck/regressions/ck_epoch/validate	--iterations 20	./ck_epoch_section
+ck_epoch_section_2	/home/aoli/repos/cprog-src/ck/regressions/ck_epoch/validate	--iterations 20	./ck_epoch_section_2 2 2 1
+ck_epoch_call	/home/aoli/repos/cprog-src/ck/regressions/ck_epoch/validate	--iterations 20	./ck_epoch_call
+ck_spin_ticket	/home/aoli/repos/cprog-src/ck/regressions/ck_spinlock/validate	--iterations 20	./ck_ticket 4 1
+ck_spin_mcs	/home/aoli/repos/cprog-src/ck/regressions/ck_spinlock/validate	--iterations 20	./ck_mcs 4 1
+ck_spin_dec	/home/aoli/repos/cprog-src/ck/regressions/ck_spinlock/validate	--iterations 20	./ck_dec 4 1
+ck_spin_cas	/home/aoli/repos/cprog-src/ck/regressions/ck_spinlock/validate	--iterations 20	./ck_cas 4 1
+ck_spin_fas	/home/aoli/repos/cprog-src/ck/regressions/ck_spinlock/validate	--iterations 20	./ck_fas 4 1
+ck_spin_clh	/home/aoli/repos/cprog-src/ck/regressions/ck_spinlock/validate	--iterations 20	./ck_clh 4 1
+ck_spin_hclh	/home/aoli/repos/cprog-src/ck/regressions/ck_spinlock/validate	--iterations 20	./ck_hclh 4 1
+ck_spin_linux	/home/aoli/repos/cprog-src/ck/regressions/ck_spinlock/validate	--iterations 20	./linux_spinlock 4 1
+ck_spin_ticket_pb	/home/aoli/repos/cprog-src/ck/regressions/ck_spinlock/validate	--iterations 20	./ck_ticket_pb 4 1
+ck_spin_anderson	/home/aoli/repos/cprog-src/ck/regressions/ck_spinlock/validate	--iterations 20	./ck_anderson 4 1
+ck_spin_spinlock	/home/aoli/repos/cprog-src/ck/regressions/ck_spinlock/validate	--iterations 20	./ck_spinlock 4 1
+ck_stack_mpmc_pair	/home/aoli/repos/cprog-src/ck/regressions/ck_stack/validate	--iterations 20	./mpmc_pair 2 1 0
+ck_stack_upmc_trypop	/home/aoli/repos/cprog-src/ck/regressions/ck_stack/validate	--iterations 20	./upmc_trypop 2 1 0
+ck_stack_mpmc_trypop	/home/aoli/repos/cprog-src/ck/regressions/ck_stack/validate	--iterations 20	./mpmc_trypop 2 1 0
+ck_stack_mpmc_trypair	/home/aoli/repos/cprog-src/ck/regressions/ck_stack/validate	--iterations 20	./mpmc_trypair 2 1 0
+ck_stack_mpmc_pop	/home/aoli/repos/cprog-src/ck/regressions/ck_stack/validate	--iterations 20	./mpmc_pop 2 1 0
+ck_stack_upmc_pop	/home/aoli/repos/cprog-src/ck/regressions/ck_stack/validate	--iterations 20	./upmc_pop 2 1 0
+ck_stack_mpnc_push	/home/aoli/repos/cprog-src/ck/regressions/ck_stack/validate	--iterations 20	./mpnc_push 2 1 0
+ck_stack_mpmc_push	/home/aoli/repos/cprog-src/ck/regressions/ck_stack/validate	--iterations 20	./mpmc_push 2 1 0
+ck_stack_upmc_push	/home/aoli/repos/cprog-src/ck/regressions/ck_stack/validate	--iterations 20	./upmc_push 2 1 0
+ck_stack_mpmc_trypush	/home/aoli/repos/cprog-src/ck/regressions/ck_stack/validate	--iterations 20	./mpmc_trypush 2 1 0
+ck_stack_upmc_trypush	/home/aoli/repos/cprog-src/ck/regressions/ck_stack/validate	--iterations 20	./upmc_trypush 2 1 0
+ck_rwlock	/home/aoli/repos/cprog-src/ck/regressions/ck_rwlock/validate	--iterations 20	./validate 2 1
+ck_brlock	/home/aoli/repos/cprog-src/ck/regressions/ck_brlock/validate	--iterations 20	./validate 2 1
+ck_bytelock	/home/aoli/repos/cprog-src/ck/regressions/ck_bytelock/validate	--iterations 20	./validate 2 1
+ck_pflock	/home/aoli/repos/cprog-src/ck/regressions/ck_pflock/validate	--iterations 20	./validate 2 1
+ck_swlock	/home/aoli/repos/cprog-src/ck/regressions/ck_swlock/validate	--iterations 20	./validate 2 1
+ck_tflock	/home/aoli/repos/cprog-src/ck/regressions/ck_tflock/validate	--iterations 20	./validate 2 1
+ck_cohort	/home/aoli/repos/cprog-src/ck/regressions/ck_cohort/validate	--iterations 20	./validate 2 2 1
+ck_rwcohort_neutral	/home/aoli/repos/cprog-src/ck/regressions/ck_rwcohort/validate	--iterations 20	./ck_neutral 2 2 1
+ck_rwcohort_rp	/home/aoli/repos/cprog-src/ck/regressions/ck_rwcohort/validate	--iterations 20	./ck_rp 2 2 1
+ck_rwcohort_wp	/home/aoli/repos/cprog-src/ck/regressions/ck_rwcohort/validate	--iterations 20	./ck_wp 2 2 1
+ck_sequence	/home/aoli/repos/cprog-src/ck/regressions/ck_sequence/validate	--iterations 20	./ck_sequence 4 1
+ck_barrier_centralized	/home/aoli/repos/cprog-src/ck/regressions/ck_barrier/validate	--iterations 20	./barrier_centralized 4 1 1
+ck_barrier_combining	/home/aoli/repos/cprog-src/ck/regressions/ck_barrier/validate	--iterations 20	./barrier_combining 4 1 1
+ck_barrier_dissemination	/home/aoli/repos/cprog-src/ck/regressions/ck_barrier/validate	--iterations 20	./barrier_dissemination 4 1 1
+ck_barrier_mcs	/home/aoli/repos/cprog-src/ck/regressions/ck_barrier/validate	--iterations 20	./barrier_mcs 4 1 1
+ck_barrier_tournament	/home/aoli/repos/cprog-src/ck/regressions/ck_barrier/validate	--iterations 20	./barrier_tournament 4 1 1
+ck_queue_list	/home/aoli/repos/cprog-src/ck/regressions/ck_queue/validate	--iterations 20	./ck_list 4 5
+ck_queue_slist	/home/aoli/repos/cprog-src/ck/regressions/ck_queue/validate	--iterations 20	./ck_slist 4 5
+ck_queue_stailq	/home/aoli/repos/cprog-src/ck/regressions/ck_queue/validate	--iterations 20	./ck_stailq 4 1000
+ck_ec_smoke	/home/aoli/repos/cprog-src/ck/regressions/ck_ec/validate	--iterations 20	./ck_ec_smoke_test
+cq_multi_producers	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run multi_producers --disable-prompt
+cq_try_dequeue_threaded	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run try_dequeue_threaded --disable-prompt
+cq_try_dequeue_bulk_threaded	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run try_dequeue_bulk_threaded --disable-prompt
+cq_implicit_producer_churn	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run implicit_producer_churn --disable-prompt
+cq_test_threaded	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run test_threaded --disable-prompt
+cq_test_threaded_bulk	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run test_threaded_bulk --disable-prompt
+cq_blocking_wrappers	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run blocking_wrappers --disable-prompt
+cq_timed_blocking_wrappers	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run timed_blocking_wrappers --disable-prompt
+cq_acquire_and_signal	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run acquire_and_signal --disable-prompt
+cq_try_acquire_and_signal	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run try_acquire_and_signal --disable-prompt
+cq_core_add_only_list	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run core_add_only_list --disable-prompt
+cq_core_thread_local	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run core_thread_local --disable-prompt
+cq_core_free_list	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run core_free_list --disable-prompt
+cq_core_spmc_hash	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run core_spmc_hash --disable-prompt
+cq_explicit_strings_threaded	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run explicit_strings_threaded --disable-prompt
+cq_implicit_producer_hash	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run implicit_producer_hash --disable-prompt
+cq_block_recycling	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run block_recycling --disable-prompt
+cq_producer_reuse	/home/aoli/repos/cprog-src/concurrentqueue/build/bin	-	./unittests --run producer_reuse --disable-prompt
+mi_stress	/home/aoli/repos/cprog-src/mimalloc/build	--iterations 50	./mimalloc-test-stress 4 4 2
+mi_stress_heaps	/home/aoli/repos/cprog-src/mimalloc/build	--iterations 50	./mimalloc-test-stress-heaps 4 4 2
+mi_api	/home/aoli/repos/cprog-src/mimalloc/build	--iterations 20	./mimalloc-test-api
+sqlite_walthread1	/home/aoli/repos/cprog-src/sqlite/run-walthread1	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 walthread1
+sqlite_walthread2	/home/aoli/repos/cprog-src/sqlite/run-walthread2	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 walthread2
+sqlite_walthread3	/home/aoli/repos/cprog-src/sqlite/run-walthread3	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 walthread3
+sqlite_walthread4	/home/aoli/repos/cprog-src/sqlite/run-walthread4	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 walthread4
+sqlite_walthread5	/home/aoli/repos/cprog-src/sqlite/run-walthread5	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 walthread5
+sqlite_dynamic_triggers	/home/aoli/repos/cprog-src/sqlite/run-dynamic_triggers	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 dynamic_triggers
+sqlite_checkpoint_starvation_1	/home/aoli/repos/cprog-src/sqlite/run-checkpoint_starvation_1	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 checkpoint_starvation_1
+sqlite_checkpoint_starvation_2	/home/aoli/repos/cprog-src/sqlite/run-checkpoint_starvation_2	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 checkpoint_starvation_2
+sqlite_create_drop_index_1	/home/aoli/repos/cprog-src/sqlite/run-create_drop_index_1	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 create_drop_index_1
+sqlite_lookaside1	/home/aoli/repos/cprog-src/sqlite/run-lookaside1	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 lookaside1
+sqlite_vacuum1	/home/aoli/repos/cprog-src/sqlite/run-vacuum1	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 vacuum1
+sqlite_stress1	/home/aoli/repos/cprog-src/sqlite/run-stress1	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 stress1
+sqlite_stress2	/home/aoli/repos/cprog-src/sqlite/run-stress2	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 stress2
+sqlite_shared1	/home/aoli/repos/cprog-src/sqlite/run-shared1	--real-time --iterations 30	/home/aoli/repos/cprog-src/sqlite/threadtest3 shared1
+tbb_concurrent_queue	/home/aoli/repos/cprog-src/oneTBB/build/gnu_16.2_cxx11_64_relwithdebinfo	--iterations 30	./test_concurrent_queue
+tbb_concurrent_hash_map	/home/aoli/repos/cprog-src/oneTBB/build/gnu_16.2_cxx11_64_relwithdebinfo	--iterations 30	./test_concurrent_hash_map
+tbb_mutex	/home/aoli/repos/cprog-src/oneTBB/build/gnu_16.2_cxx11_64_relwithdebinfo	--iterations 30	./test_mutex
+tbb_task_group	/home/aoli/repos/cprog-src/oneTBB/build/gnu_16.2_cxx11_64_relwithdebinfo	--iterations 30	./test_task_group
+tbb_concurrent_vector	/home/aoli/repos/cprog-src/oneTBB/build/gnu_16.2_cxx11_64_relwithdebinfo	--iterations 30	./test_concurrent_vector
+tbb_concurrent_priority_queue	/home/aoli/repos/cprog-src/oneTBB/build/gnu_16.2_cxx11_64_relwithdebinfo	--iterations 30	./test_concurrent_priority_queue
+tbb_task_arena	/home/aoli/repos/cprog-src/oneTBB/build/gnu_16.2_cxx11_64_relwithdebinfo	--iterations 30	./test_task_arena
+tbb_concurrent_map	/home/aoli/repos/cprog-src/oneTBB/build/gnu_16.2_cxx11_64_relwithdebinfo	--iterations 30	./test_concurrent_map
+tbb_conformance_concurrent_queue	/home/aoli/repos/cprog-src/oneTBB/build/gnu_16.2_cxx11_64_relwithdebinfo	--iterations 30	./conformance_concurrent_queue

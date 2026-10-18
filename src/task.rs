@@ -47,6 +47,20 @@ pub enum State {
     Exited,
 }
 
+/// What a syscall can block on.  A thread sleeping in a `Tracee` syscall
+/// can only be woken by another tracee (all stopped) or a virtual timer, so
+/// seeing it asleep means it is blocked, deterministically.  An `External`
+/// syscall (sockets whose peer is not a tracee, devices) may complete on
+/// its own after a short sleep, so it gets a real-time grace.  `Never`:
+/// disk I/O and the like, waited for however long it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BlockClass {
+    #[default]
+    Never,
+    Tracee,
+    External,
+}
+
 pub struct Task {
     pub tid: pid_t,
     pub tgid: pid_t,
@@ -63,6 +77,8 @@ pub struct Task {
     pub in_syscall: bool,
     /// Syscall number of the syscall in progress (valid when `in_syscall`).
     pub syscall_nr: u64,
+    /// What the syscall being executed can block on (decided at its entry).
+    pub block_class: BlockClass,
     /// Set when a PTRACE_INTERRUPT was requested and its stop not yet consumed.
     pub interrupt_pending: bool,
     /// Number of exec events seen.
@@ -165,6 +181,7 @@ impl Task {
             mem_restore: None,
             exit_status: None,
             exit_reported: false,
+            block_class: BlockClass::Never,
             sig_epoch_seen: 0,
             bound_port: None,
             port_tries: 0,
@@ -240,7 +257,7 @@ impl Task {
             self.exec_bp = None;
         }
         self.pushf_target = None;
-        self.stepping = how == ResumeHow::SingleStep;
+        self.stepping = matches!(how, ResumeHow::SingleStep | ResumeHow::BlockStep);
         if self.stepping && sig == 0 {
             // A single-stepped `pushf` pushes the flags with the trap flag
             // the step itself set; a later `popf` would then re-enable
@@ -290,6 +307,26 @@ impl Task {
         }
         self.regs = Some(r);
         Ok(())
+    }
+
+    /// The kernel reported this task's death through a wait outside the
+    /// usual paths (a remote syscall): record it and let the scheduler
+    /// report the exit.
+    pub fn note_death(&mut self, st: WaitStatus) {
+        let _ = self.hpc.stop();
+        self.state = State::Exited;
+        match st {
+            WaitStatus::Exited(code) => {
+                self.exit_code = Some(code);
+                self.exit_status = Some((code & 0xff) << 8);
+            }
+            WaitStatus::Signaled(sig) => {
+                self.exit_code = Some(128 + sig);
+                self.exit_status = Some(sig);
+            }
+            _ => {}
+        }
+        self.unreported = true;
     }
 
     /// Record that a wait status was observed for this task.  Updates ticks,

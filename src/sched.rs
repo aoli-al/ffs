@@ -54,6 +54,11 @@ pub struct SchedContext<'a> {
     /// Spin level of `current` (see `SpinTracker`): 0 unless its last few
     /// slices all ended by tick budget in the same code page.
     pub spin_level: u32,
+    /// Threads that were blocked at the previous decision and are enabled
+    /// now: woken by the last step (or by a virtual timer).
+    pub woken: &'a [Ltid],
+    /// Enabled threads currently classified as spinning (see `SpinTracker`).
+    pub spinning: &'a [Ltid],
 }
 
 /// Busy-wait detection.  Under a serializing scheduler a thread that spins
@@ -73,12 +78,22 @@ pub struct SpinTracker {
     /// Per thread: page of the last preemption, consecutive same-page
     /// preemptions.
     per: std::collections::BTreeMap<Ltid, (u64, u32)>,
+    /// Per thread: consecutive preemptions on any page.  A thread that
+    /// retries an operation until another thread finishes its change (an
+    /// optimistic descent restarting from the root while a writer holds a
+    /// node) runs a loop spread over many pages; under strict priorities it
+    /// never ends either.
+    runs: std::collections::BTreeMap<Ltid, u32>,
 }
 
 /// Same-page preemptions before a thread counts as spinning.
 const SPIN_STREAK: u32 = 2;
-/// Smallest slice a spinner is given (ticks).
-pub const SPIN_MIN_SLICE: u64 = 16 * 1024;
+/// Smallest slice a spinner is given (ticks): about the cost of the
+/// scheduling step itself, so a spinner burns no more than that per turn.
+pub const SPIN_MIN_SLICE: u64 = 2 * 1024;
+/// Probability that the random policy chooses among the non-spinning
+/// threads when there are any.
+const SPIN_AVOID: f64 = 0.85;
 
 impl SpinTracker {
     pub fn observe(&mut self, step: &Step, watch_preempt: bool) {
@@ -93,6 +108,7 @@ impl SpinTracker {
                 } else {
                     *e = (page, 1);
                 }
+                *self.runs.entry(step.ltid).or_insert(0) += 1;
             }
             Event::Fork | Event::SyscallEntry { .. } => {}
             _ => {
@@ -102,8 +118,25 @@ impl SpinTracker {
                 if let Some(e) = self.per.get_mut(&step.ltid) {
                     e.1 = e.1.saturating_sub(1);
                 }
+                if let Some(r) = self.runs.get_mut(&step.ltid) {
+                    *r = r.saturating_sub(1);
+                }
             }
         }
+    }
+
+    /// 0: the thread's last events were not all preemptions; n: it was
+    /// preempted n + `SPIN_STREAK` times in a row, on any pages.  What a
+    /// policy with strict priorities (PCT) uses to bound how long a thread
+    /// runs while others could: a spinner or retry loop at the top priority
+    /// otherwise starves the thread it waits for.
+    pub fn run_level(&self, ltid: Ltid) -> u32 {
+        self.runs.get(&ltid).map(|r| r.saturating_sub(SPIN_STREAK)).unwrap_or(0)
+    }
+
+    /// The threads among `enabled` that are spinning.
+    pub fn spinning(&self, enabled: &[Ltid]) -> Vec<Ltid> {
+        enabled.iter().copied().filter(|l| self.level(*l) > 0).collect()
     }
 
     /// 0: not spinning; n: spinning, n levels deep.
@@ -230,6 +263,8 @@ pub struct Random {
     /// Probability of holding a thread back after a watchpoint hit.
     pub watch_hold: f64,
     hold: WatchHold,
+    pub wake_delay: f64,
+    wake: WakeDelay,
 }
 
 impl Random {
@@ -250,6 +285,8 @@ impl Random {
             max_steps,
             watch_hold: 0.0,
             hold: WatchHold::default(),
+            wake_delay: 0.0,
+            wake: WakeDelay::default(),
         }
     }
 }
@@ -262,7 +299,19 @@ impl Policy for Random {
         let preempted = (matches!(ctx.last_event, Some(Event::Preempt | Event::Slice)) && !ctx.watch_preempt)
             || is_yield(ctx.last_event);
         let held = self.hold.update(ctx, &mut self.rng, self.watch_hold);
-        let enabled: Vec<Ltid> = ctx.enabled.iter().copied().filter(|&l| Some(l) != held).collect();
+        self.wake.update(ctx, &mut self.rng, self.wake_delay);
+        let enabled: Vec<Ltid> = self.wake.filter(ctx.enabled, ctx.step).into_iter().filter(|&l| Some(l) != held).collect();
+        let enabled = if enabled.is_empty() { ctx.enabled.to_vec() } else { enabled };
+        // A spinner waits for someone else: running it again is almost
+        // never the step that makes progress, so most of the time the
+        // choice is made among the others (it still gets its turn, which
+        // a lock holder spinning on a second lock needs).
+        let non_spinners: Vec<Ltid> = enabled.iter().copied().filter(|l| !ctx.spinning.contains(l)).collect();
+        let enabled = if !non_spinners.is_empty() && non_spinners.len() < enabled.len() && self.rng.gen_bool(SPIN_AVOID) {
+            non_spinners
+        } else {
+            enabled
+        };
         let keep = match ctx.current {
             Some(c) if enabled.contains(&c) && !preempted => !self.rng.gen_bool(self.switch_prob),
             _ => false,
@@ -308,10 +357,21 @@ pub struct Pct {
     pub max_steps: u32,
     /// Probability that a watchpoint hit acts as a priority change point.
     pub watch_hold: f64,
+    pub wake_delay: f64,
+    wake: WakeDelay,
     priorities: std::collections::BTreeMap<Ltid, i64>,
     change_points: Vec<usize>,
     step: usize,
     lowest: i64,
+    /// Spin levels (`SpinTracker`) the running thread may reach before it
+    /// counts as yielding.  A thread spinning on a latch a lower-priority
+    /// thread holds must be demoted or nothing ever runs the holder; but a
+    /// long numeric loop looks the same, and demoting it loses every
+    /// schedule where it finishes before the others start.  Drawn
+    /// log-uniformly per policy (per branch), so that some branches keep
+    /// a looping thread and others move on quickly.
+    spin_patience: u32,
+    debug: bool,
 }
 
 impl Pct {
@@ -322,6 +382,7 @@ impl Pct {
         let k = expected_steps.max(1);
         let mut change_points: Vec<usize> = (1..depth).map(|_| rng.gen_range(0..k)).collect();
         change_points.sort_unstable();
+        let spin_patience = log_uniform(&mut rng, SPIN_PATIENCE_MAX) as u32;
         Pct {
             rng,
             depth,
@@ -330,13 +391,22 @@ impl Pct {
             max_slice,
             max_steps,
             watch_hold: 0.0,
+            wake_delay: 0.0,
+            wake: WakeDelay::default(),
             priorities: Default::default(),
             change_points,
             step: 0,
             lowest: 0,
+            spin_patience,
+            debug: std::env::var_os("FFS_PCT_DEBUG").is_some(),
         }
     }
 }
+
+/// The most spin levels a PCT policy tolerates: a level is one preemption,
+/// a slice of at most `--max-slice` ticks (shrunk under `sched::run`), so a
+/// few million ticks of spinning at most before the spinner is demoted.
+const SPIN_PATIENCE_MAX: u64 = 256;
 
 impl Policy for Pct {
     fn decide(&mut self, ctx: &SchedContext) -> Result<Decision> {
@@ -355,17 +425,27 @@ impl Policy for Pct {
             // dropping its priority lets another thread reach the
             // conflicting access first.
             let watch_hit = ctx.watch_preempt && self.watch_hold > 0.0 && self.rng.gen_bool(self.watch_hold);
-            if self.change_points.contains(&self.step) || is_yield(ctx.last_event) || ctx.spin_level > 0 || watch_hit {
+            if self.change_points.contains(&self.step) || is_yield(ctx.last_event) || ctx.spin_level >= self.spin_patience || watch_hit {
                 self.lowest -= 1;
                 self.priorities.insert(c, self.lowest);
+                if self.debug {
+                    eprintln!(
+                        "[pct] step {} T{c} demoted (change point {}, yield {}, spin {}/{}) enabled={:?} prios={:?}",
+                        self.step,
+                        self.change_points.contains(&self.step),
+                        is_yield(ctx.last_event),
+                        ctx.spin_level,
+                        self.spin_patience,
+                        ctx.enabled,
+                        self.priorities
+                    );
+                }
             }
         }
         self.step += 1;
-        let ltid = *ctx
-            .enabled
-            .iter()
-            .max_by_key(|l| self.priorities[l])
-            .unwrap();
+        self.wake.update(ctx, &mut self.rng, self.wake_delay);
+        let eligible = self.wake.filter(ctx.enabled, ctx.step);
+        let ltid = *eligible.iter().max_by_key(|l| self.priorities[l]).unwrap();
         let mut budget = if self.max_budget > 0 && self.rng.gen_bool(self.preempt_prob) {
             log_uniform(&mut self.rng, self.max_budget)
         } else {
@@ -611,6 +691,7 @@ pub type StepHook<'a> = &'a mut dyn FnMut(&mut Session, &Step) -> Result<Option<
 /// the execution is over (all exited / deadlock), otherwise the enabled set.
 pub fn observe(session: &mut Session, expected_vt: Option<u64>) -> Result<std::result::Result<Vec<Ltid>, Outcome>> {
     session.settle()?;
+    session.wait_wakes()?;
     if session.all_exited() {
         let code = session.main_exit_code().unwrap_or(0);
         return Ok(Err(match code {
@@ -628,8 +709,10 @@ pub fn observe(session: &mut Session, expected_vt: Option<u64>) -> Result<std::r
             c => Outcome::Exited { code: c },
         }));
     }
-    if let Some((vtime_ns, runnable, blocked)) = session.hang_check() {
-        return Ok(Err(Outcome::Hang { vtime_ns, runnable, blocked }));
+    if session.main_exit_code().is_none() {
+        if let Some((vtime_ns, runnable, blocked)) = session.hang_check() {
+            return Ok(Err(Outcome::Hang { vtime_ns, runnable, blocked }));
+        }
     }
     let mut enabled = session.enabled();
     if enabled.is_empty() {
@@ -673,7 +756,11 @@ pub fn observe(session: &mut Session, expected_vt: Option<u64>) -> Result<std::r
 pub fn perform(session: &mut Session, decision: &Decision) -> Result<Step> {
     let (ltid, event) = match decision {
         Decision::Run { ltid, budget, steps } => {
-            let mut ev = session.run_task(*ltid, *budget)?;
+            let mut ev = if session.opts.exact_preempt && *budget > 0 && !session.replay {
+                session.run_task_exact(*ltid, *budget)?
+            } else {
+                session.run_task(*ltid, *budget)?
+            };
             if ev == Event::Preempt && *steps > 0 && !session.watch_preempt {
                 ev = session.step_instructions(*ltid, *steps)?;
             }
@@ -744,6 +831,7 @@ pub fn drive(
     let mut last_event: Option<Event> = None;
     let mut steps = 0usize;
     let mut spin = SpinTracker::default();
+    let mut prev_blocked: Vec<Ltid> = Vec::new();
     let finish = |trace: &mut Trace, outcome: Outcome| {
         trace.outcome = outcome.clone();
         Ok(outcome)
@@ -774,6 +862,9 @@ pub fn drive(
         }
         let vt_before = session.virtual_ns();
         let blocked = session.blocked();
+        let woken: Vec<Ltid> = enabled.iter().copied().filter(|l| prev_blocked.contains(l)).collect();
+        prev_blocked = blocked.clone();
+        let spinning = spin.spinning(&enabled);
         if opts.verbose {
             eprintln!("[ffs]       enabled={enabled:?} blocked={blocked:?} vt={}", session.virtual_ns());
         }
@@ -785,6 +876,8 @@ pub fn drive(
             step: trace.steps.len(),
             watch_preempt: session.watch_preempt,
             spin_level: current.map(|c| spin.level(c)).unwrap_or(0),
+            woken: &woken,
+            spinning: &spinning,
         })?;
         if let Decision::Stop(outcome) = decision {
             return finish(trace, outcome);
@@ -802,6 +895,10 @@ pub fn drive(
         let mut step = perform(session, &decision)?;
         step.vt = vt_before;
         spin.observe(&step, session.watch_preempt);
+        if matches!(step.event, Event::Exit | Event::Exited { .. }) {
+            // A thread's exit wakes its joiners (CLONE_CHILD_CLEARTID).
+            session.wake_pending = true;
+        }
         if opts.verbose {
             eprintln!(
                 "[ffs] {:5} T{} ticks={} rip={:#x} vt={} {}",
@@ -850,6 +947,8 @@ pub struct PolicyParams {
     pub watch_count: u32,
     /// Probability of holding a thread back after a watchpoint hit.
     pub watch_hold: f64,
+    /// Probability of delaying a just-woken thread (see `WakeDelay`).
+    pub wake_delay: f64,
 }
 
 /// Events a thread held back after a watchpoint hit stays unscheduled.
@@ -889,6 +988,42 @@ impl WatchHold {
     }
 }
 
+/// Longest delay (events) of a just-woken thread.
+const WAKE_DELAY_MAX: u64 = 64;
+
+/// Natively a thread woken by another needs tens of microseconds to get a
+/// CPU, and the waker keeps running meanwhile; a serializing scheduler that
+/// picks the woken thread at once never explores that window (tokio's
+/// blocking-pool shutdown race, #7922, fails natively every time and under
+/// `random` in one schedule of seven).  With probability `prob` a woken
+/// thread is kept off the enabled set for a log-uniform number of events.
+#[derive(Default)]
+struct WakeDelay {
+    until: std::collections::BTreeMap<Ltid, usize>,
+}
+
+impl WakeDelay {
+    fn update(&mut self, ctx: &SchedContext, rng: &mut ChaCha8Rng, prob: f64) {
+        self.until.retain(|_, u| *u > ctx.step);
+        if prob <= 0.0 {
+            return;
+        }
+        for &w in ctx.woken {
+            if Some(w) != ctx.current && !self.until.contains_key(&w) && rng.gen_bool(prob) {
+                let d = log_uniform(rng, WAKE_DELAY_MAX).max(1) as usize;
+                self.until.insert(w, ctx.step + d);
+            }
+        }
+    }
+
+    /// The enabled set without the delayed threads (all of it if nothing
+    /// else could run).
+    fn filter(&self, enabled: &[Ltid], step: usize) -> Vec<Ltid> {
+        let v: Vec<Ltid> = enabled.iter().copied().filter(|l| self.until.get(l).is_none_or(|u| *u <= step)).collect();
+        if v.is_empty() { enabled.to_vec() } else { v }
+    }
+}
+
 /// `branch` selects the member of a policy portfolio (`mix` alternates
 /// random and PCT, which find different bugs).
 pub fn make_policy(p: &PolicyParams, seed: u64, expected_steps: usize) -> Result<Box<dyn Policy>> {
@@ -912,11 +1047,13 @@ pub fn make_branch_policy(p: &PolicyParams, seed: u64, expected_steps: usize, br
         "random" => {
             let mut r = Random::new(seed, p.preempt_prob, p.max_budget, p.switch_prob, p.max_slice, p.max_steps);
             r.watch_hold = p.watch_hold;
+            r.wake_delay = p.wake_delay;
             Box::new(r)
         }
         "pct" => {
             let mut r = Pct::new(seed, p.pct_depth, expected_steps, p.preempt_prob, p.max_budget, p.max_slice, p.max_steps);
             r.watch_hold = p.watch_hold;
+            r.wake_delay = p.wake_delay;
             Box::new(r)
         }
         other => bail!("unknown policy {other}"),

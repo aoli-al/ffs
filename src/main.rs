@@ -81,10 +81,20 @@ struct CommonOpts {
     /// are not affected in practice.
     #[arg(long, default_value_t = 300.0)]
     max_vtime: f64,
-    /// Microseconds a thread may sleep inside a syscall before it counts as
-    /// blocked (the scheduler then switches away).
-    #[arg(long, default_value_t = 100)]
+    /// Microseconds a thread may sleep inside a syscall on external I/O (a
+    /// socket whose peer is not a tracee, a device) before it counts as
+    /// blocked.  Waits that only another tracee or a virtual timer can end
+    /// (futex, poll, pipes, socket pairs, wait4...) count as blocked as soon
+    /// as the thread sleeps, independent of machine load.
+    #[arg(long, default_value_t = 1000)]
     block_grace_us: u64,
+    /// Stop each tick budget at exactly its count (counter armed early,
+    /// then block-stepped to the target) instead of where the counter's
+    /// interrupt lands, which varies by 20-250 branches with its skid.
+    /// With this, an exploration with the same seed repeats exactly; it
+    /// costs up to a few hundred extra stops per preemption.
+    #[arg(long)]
+    exact_preempt: bool,
     /// Milliseconds of real time a thread may run user code without any
     /// scheduling event before it is preempted regardless of ticks (a loop
     /// without conditional branches never reaches a tick budget). Zero disables
@@ -155,6 +165,13 @@ struct PolicyOpts {
     /// read-modify-write window.  0 disables this (the default).
     #[arg(long, default_value_t = 0.0)]
     watch_hold: f64,
+    /// Probability that a thread another thread has just woken is kept off
+    /// the CPU for a while (log-uniform up to 64 events): natively a woken
+    /// thread needs tens of microseconds to run, during which the waker
+    /// goes on, and races in that window (a shutdown racing a wakeup) are
+    /// otherwise found rarely.  0 disables it.
+    #[arg(long, default_value_t = 0.3)]
+    wake_delay: f64,
     /// Maximum ticks a thread may run while others are runnable (0 =
     /// unlimited).  100k ticks cost about as much as the scheduling step
     /// itself, and bound what a busy-waiting thread burns per slice (a
@@ -255,6 +272,7 @@ fn session_opts(c: &CommonOpts, seed: u64) -> SessionOpts {
         virtual_random: !c.real_random,
         isolate_files: false,
         block_grace: Duration::from_micros(c.block_grace_us),
+        exact_preempt: c.exact_preempt,
         seed,
         deadlock_timeout: Duration::from_secs_f64(c.deadlock_timeout),
         deadlock_wakes: c.deadlock_wakes,
@@ -558,6 +576,7 @@ impl From<PolicyOpts> for sched::PolicyParams {
             watch: p.watch,
             watch_count: p.watch_count,
             watch_hold: p.watch_hold,
+            wake_delay: p.wake_delay,
         }
     }
 }

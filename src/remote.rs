@@ -13,6 +13,21 @@ use crate::mem::read_maps;
 use crate::ptrace::{self, Regs, ResumeHow, WaitStatus, SYSCALL_INSN};
 use crate::task::{State, Stop, Task};
 
+/// The tracee died (its process was killed) while a syscall was being
+/// injected into it.  The status is recorded on the task; callers acting
+/// on the tracee's behalf treat this as "the task is gone" and let the
+/// scheduler report the exit.
+#[derive(Debug)]
+pub struct TaskDied(pub pid_t);
+
+impl std::fmt::Display for TaskDied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "task {} died during remote syscall", self.0)
+    }
+}
+
+impl std::error::Error for TaskDied {}
+
 pub struct Remote<'a> {
     pub task: &'a mut Task,
     saved_regs: Regs,
@@ -154,8 +169,8 @@ impl<'a> Remote<'a> {
                     continue;
                 }
                 WaitStatus::Exited(_) | WaitStatus::Signaled(_) => {
-                    self.task.state = State::Exited;
-                    bail!("task {tid} died during remote syscall");
+                    self.task.note_death(st);
+                    return Err(TaskDied(tid).into());
                 }
                 other => bail!("remote syscall: unexpected status {other:?}"),
             }
@@ -178,8 +193,8 @@ impl<'a> Remote<'a> {
                 WaitStatus::Event(ptrace::PTRACE_EVENT_STOP) | WaitStatus::GroupStop(_) => continue,
                 WaitStatus::Signal(_) => continue,
                 WaitStatus::Exited(_) | WaitStatus::Signaled(_) => {
-                    self.task.state = State::Exited;
-                    bail!("task {tid} died during remote syscall");
+                    self.task.note_death(st);
+                    return Err(TaskDied(tid).into());
                 }
                 other => bail!("remote syscall: unexpected status {other:?}"),
             }

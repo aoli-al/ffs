@@ -7,3 +7,8 @@
 /tests/flink/classes-*.txt
 /tests/flink/results
 /tests/flink/target
+/tests/bbtree/out
+/tests/crates/build
+/tests/crates/results
+/tests/crates/*.log
+/tests/liquid-cache/out

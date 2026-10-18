@@ -71,13 +71,18 @@ pub enum ResumeHow {
     Cont,
     Syscall,
     SingleStep,
+    /// Run to the next taken branch (x86 BTF, `PTRACE_SINGLEBLOCK`).
+    BlockStep,
 }
+
+const PTRACE_SINGLEBLOCK: libc::c_uint = 33;
 
 pub fn resume(pid: pid_t, how: ResumeHow, sig: i32) -> Result<()> {
     let req = match how {
         ResumeHow::Cont => libc::PTRACE_CONT,
         ResumeHow::Syscall => libc::PTRACE_SYSCALL,
         ResumeHow::SingleStep => libc::PTRACE_SINGLESTEP,
+        ResumeHow::BlockStep => PTRACE_SINGLEBLOCK,
     };
     unsafe { raw(req, pid, std::ptr::null_mut(), sig as c_long as *mut c_void) }
         .with_context(|| format!("resume {pid} {how:?} sig={sig}"))?;

@@ -98,6 +98,11 @@ fn run_branch(
     let mut n = 0usize;
     let mut drain = sched::Fifo::new(DRAIN_SLICE);
     let mut draining = false;
+    // Busy-wait detection, as in `sched::run`: a thread spinning on a latch
+    // another thread holds would otherwise keep PCT's highest priority
+    // until the depth bound, while the holder never runs.
+    let mut spin = sched::SpinTracker::default();
+    let mut prev_blocked: Vec<Ltid> = Vec::new();
     loop {
         if crate::session::TERMINATED.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(Outcome::Error { msg: "terminated by SIGTERM".into() });
@@ -121,20 +126,50 @@ fn run_branch(
         }
         let blocked = session.blocked();
         let policy: &mut dyn Policy = if draining { &mut drain } else { &mut *policy };
-        let decision = policy.decide(&SchedContext {
+        // The policy sees how long the thread has run uninterrupted (PCT
+        // demotes it once its patience is over, fifo rotates) but the
+        // slices are not shrunk as `sched::run` shrinks them: a long loop
+        // cut into many short slices is many more steps, and PCT places
+        // its change points per step, so nearly every branch would demote
+        // the looping thread inside its loop.
+        let woken: Vec<Ltid> = enabled.iter().copied().filter(|l| prev_blocked.contains(l)).collect();
+        prev_blocked = blocked.clone();
+        let spinning = spin.spinning(&enabled);
+        if ropts.verbose {
+            eprintln!("[ffs]       enabled={enabled:?} blocked={blocked:?} woken={woken:?} spinning={spinning:?}");
+        }
+        let mut decision = policy.decide(&SchedContext {
             current,
             last_event: steps.last().map(|s| &s.event),
             enabled: &enabled,
             blocked: &blocked,
             step: steps.len(),
             watch_preempt: session.watch_preempt,
-            spin_level: 0,
+            spin_level: current.map(|c| spin.run_level(c)).unwrap_or(0),
+            woken: &woken,
+            spinning: &spinning,
         })?;
         if let Decision::Stop(o) = decision {
             return Ok(o);
         }
+        if let Decision::Run { ltid, budget, steps: insn } = &mut decision {
+            // Only a detected spinner's slices are shrunk (a general
+            // shrink would multiply the steps of every long loop and put
+            // PCT's change points inside them); it costs the spinner's
+            // turn about one scheduling step instead of a whole slice.
+            let capped = if enabled.len() > 1 { spin.cap(*ltid, *budget) } else { *budget };
+            if capped != *budget {
+                *budget = capped;
+                *insn = 0;
+            }
+        }
         let mut step = perform(session, &decision)?;
         step.vt = vt_before;
+        spin.observe(&step, session.watch_preempt);
+        if matches!(step.event, Event::Exit | Event::Exited { .. }) {
+            // A thread's exit wakes its joiners (CLONE_CHILD_CLEARTID).
+            session.wake_pending = true;
+        }
         if ropts.verbose {
             eprintln!(
                 "[ffs]   T{} ticks={} rip={:#x} {}",
@@ -164,6 +199,8 @@ fn run_branch(
 }
 
 struct Explorer {
+    /// `--exact-preempt`: preemptions whose early stop overshot the target.
+    overshoots: u64,
     argv: Vec<String>,
     pmu: PmuConfig,
     ropts: RunOpts,
@@ -272,24 +309,24 @@ impl Explorer {
             }
         }
         if addrs.is_empty() && self.params.watch_count > 0 && !self.globals.is_empty() {
-            // Distinct 8-byte slots covered by the globals (neighbouring
-            // small variables share one).
-            let mut slots: Vec<(u64, &str)> = Vec::new();
-            for g in &self.globals {
-                for i in 0..g.size.div_ceil(8).max(1) {
-                    let a = (g.addr & !7) + 8 * i;
-                    if !slots.iter().any(|(x, _)| *x == a) {
-                        slots.push((a, g.name.as_str()));
-                    }
-                }
-            }
-            let n = (self.params.watch_count as usize).min(4).min(slots.len());
+            // A random global, then a random 8-byte slot inside it: a
+            // large static buffer counts once, not once per slot (libuv's
+            // test binary has megabytes of them, and enumerating every
+            // slot took forever).  Neighbouring small variables share a
+            // slot, so the same address can come up twice; it is kept once.
+            let mut cands: Vec<(u64, u64, &str)> =
+                self.globals.iter().map(|g| (g.addr & !7, g.size.div_ceil(8).max(1), g.name.as_str())).collect();
+            let n = (self.params.watch_count as usize).min(4).min(cands.len());
             let mut names = Vec::new();
             for i in 0..n {
-                let j = self.rng.gen_range(i..slots.len());
-                slots.swap(i, j);
-                addrs.push(slots[i].0);
-                names.push(slots[i].1.to_string());
+                let j = self.rng.gen_range(i..cands.len());
+                cands.swap(i, j);
+                let (base, nslots, name) = cands[i];
+                let a = base + 8 * self.rng.gen_range(0..nslots);
+                if !addrs.contains(&a) {
+                    addrs.push(a);
+                    names.push(name.to_string());
+                }
             }
             if self.ropts.verbose {
                 eprintln!("[ffs]   watching {}", names.join(", "));
@@ -326,6 +363,7 @@ impl Explorer {
                 self.eopts.max_depth,
                 &mut steps,
             )?;
+            self.overshoots += session.exact_overshoots;
             let ports = session.ports_used.clone();
             session.kill_all();
             session.restore_files();
@@ -757,6 +795,7 @@ pub fn explore(
     );
 
     let mut ex = Explorer {
+        overshoots: 0,
         argv,
         pmu,
         ropts,
@@ -795,6 +834,12 @@ pub fn explore(
         "[ffs] explored {} branches, {} failing",
         ex.branches, ex.failures
     );
+    if ex.overshoots > 0 {
+        eprintln!(
+            "[ffs] --exact-preempt: {} preemptions overshot the early stop (interrupt skid beyond the margin); those are not reproducible",
+            ex.overshoots
+        );
+    }
     // Put back the files the bootstrap phase wrote, so that a run leaves
     // the working directory as it found it.
     ex.root.restore_files();

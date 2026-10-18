@@ -826,6 +826,8 @@ impl Session {
             exit_override: BTreeMap::new(),
             exited_procs: self.exited_procs.clone(),
             socket_peers: self.socket_peers.clone(),
+            wake_pending: false,
+            exact_overshoots: 0,
             watchpoints: Vec::new(),
             watch_requests: self.watch_requests.clone(),
             watch_pending: Default::default(),

@@ -697,7 +697,7 @@ impl Session {
                         continue;
                     }
                     (Some(_), Some(tid)) => {
-                        let ret = {
+                        let injected: Result<i64> = (|| {
                             let t = self.task_mut(tid)?;
                             let mut remote = crate::remote::Remote::new(t)?;
                             let mut spec = [0u8; 32];
@@ -705,7 +705,18 @@ impl Session {
                             let addr = remote.push_scratch(&spec)?;
                             let ret = remote.syscall(TIMERFD_SETTIME, &[fd as u64, 0, addr, 0])?;
                             remote.restore()?;
-                            ret
+                            Ok(ret)
+                        })();
+                        let ret = match injected {
+                            Ok(ret) => ret,
+                            Err(e) if e.is::<crate::remote::TaskDied>() => {
+                                // Killed under us: the timer fires later if
+                                // another thread of the process is left.
+                                self.vtimers[i].deadline = Some(deadline);
+                                i += 1;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
                         };
                         if ret < 0 {
                             log::debug!("timerfd {fd}: injected timerfd_settime failed: {ret}");
@@ -816,13 +827,28 @@ impl Session {
             let left = vb.deadline.map(|d| d.saturating_sub(now)).unwrap_or(0);
             let _ = write_ts(t, vb.rem, left);
         }
-        let mut r = t.regs()?;
+        let regs = t.regs();
+        let Ok(mut r) = regs else {
+            return self.vanished_or(tid, regs.map(|_| ()));
+        };
         r.rax = ret as u64;
-        t.set_regs(&r)?;
+        if let Err(e) = t.set_regs(&r) {
+            return self.vanished_or(tid, Err(e));
+        }
         t.in_syscall = false;
         t.state = State::Stopped(Stop::SyscallExit { nr: vb.nr, ret });
         t.unreported = true;
         Ok(())
+    }
+
+    /// `set_regs`/`regs` on a task that died under us (its process was
+    /// killed) fail with ESRCH: record the death instead of failing the
+    /// run; any other error propagates.
+    fn vanished_or(&mut self, tid: pid_t, r: Result<()>) -> Result<()> {
+        match r {
+            Err(e) if format!("{e:#}").contains("os error 3") => self.task_vanished(tid),
+            other => other,
+        }
     }
 
     /// Give a thread blocked in the kernel with a stripped timeout its
@@ -842,9 +868,14 @@ impl Session {
             return Ok(());
         }
         let nr = t.syscall_nr;
-        let mut r = t.regs()?;
+        let regs = t.regs();
+        let Ok(mut r) = regs else {
+            return self.vanished_or(tid, regs.map(|_| ()));
+        };
         r.rax = ret as u64;
-        t.set_regs(&r)?;
+        if let Err(e) = t.set_regs(&r) {
+            return self.vanished_or(tid, Err(e));
+        }
         t.restarting = false;
         t.in_syscall = false;
         t.state = State::Stopped(Stop::SyscallExit { nr, ret });

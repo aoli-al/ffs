@@ -30,6 +30,20 @@ impl Mem {
         self.pid
     }
 
+    /// Read as much of `buf` as is mapped from `addr` on (a page boundary
+    /// may end the mapping); returns the number of bytes read.
+    pub fn read_partial(&self, addr: u64, buf: &mut [u8]) -> usize {
+        if self.read(addr, buf).is_ok() {
+            return buf.len();
+        }
+        let page_end = ((addr | 0xfff) + 1 - addr) as usize;
+        let n = page_end.min(buf.len());
+        if n < buf.len() && self.read(addr, &mut buf[..n]).is_ok() {
+            return n;
+        }
+        0
+    }
+
     pub fn read(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
         if let Some(f) = &self.file {
             if f.read_exact_at(buf, addr).is_ok() {

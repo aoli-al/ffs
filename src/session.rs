@@ -84,6 +84,10 @@ pub struct SessionOpts {
     /// wake a thread waiting on another tracee, so this only needs to cover
     /// transient sleeps inside a syscall that completes by itself.
     pub block_grace: Duration,
+    /// Stop a tick budget at exactly its count (arm the counter early,
+    /// then block-step to the target) instead of wherever the counter's
+    /// interrupt lands, so that an exploration repeats exactly.
+    pub exact_preempt: bool,
     pub seed: u64,
     /// Seconds to wait for a blocked thread before declaring a deadlock.
     pub deadlock_timeout: Duration,
@@ -119,7 +123,8 @@ impl Default for SessionOpts {
             virtual_time: false,
             virtual_random: true,
             isolate_files: false,
-            block_grace: Duration::from_micros(100),
+            block_grace: Duration::from_micros(1000),
+            exact_preempt: false,
             seed: 0,
             deadlock_timeout: Duration::from_secs(3),
             env: None,
@@ -189,6 +194,13 @@ pub struct Session {
     pub exited_procs: std::collections::BTreeSet<Ltid>,
     /// Peer socket inodes of socketpairs created by tracees, both ways.
     pub socket_peers: BTreeMap<u64, u64>,
+    /// The last step may have woken a blocked thread (a futex wake, a write
+    /// to a pipe, a signal, an exit): its stop is in flight in the kernel.
+    pub wake_pending: bool,
+    /// `--exact-preempt`: budgets whose early stop had already passed the
+    /// target (interrupt skid beyond the margin); those preemptions are
+    /// not reproducible.
+    pub exact_overshoots: u64,
     /// Addresses watched with hardware watchpoints (see `watch.rs`).
     pub watchpoints: Vec<u64>,
     /// 8-byte slots the program asked to have watched (`ffs_watch`): heap
@@ -311,6 +323,11 @@ pub struct DeadlockInfo {
     pub vtime_ns: u64,
     pub wakes: u64,
 }
+
+/// Ticks the counter is armed early in `run_task_exact`.
+const EXACT_MARGIN: u64 = 512;
+/// Bytes of code scanned ahead for a syscall instruction before a block step.
+const EXACT_SCAN: usize = 4096;
 
 impl Session {
     /// Something other than a virtual deadline made a thread runnable.
@@ -565,6 +582,8 @@ impl Session {
             exit_override: BTreeMap::new(),
             exited_procs: std::collections::BTreeSet::new(),
             socket_peers: BTreeMap::new(),
+            wake_pending: false,
+            exact_overshoots: 0,
             watchpoints: Vec::new(),
             watch_requests: Vec::new(),
             watch_pending: Default::default(),
@@ -664,6 +683,40 @@ impl Session {
     pub fn virtual_ns(&self) -> u64 {
         let ticks: u64 = self.tasks.values().map(|t| t.ticks).sum();
         ticks + self.vclock.events * 1000 + self.vclock.skew
+    }
+
+    /// A ptrace request found the task gone (its process was killed while
+    /// the tracer acted on it): collect its status and let the scheduler
+    /// report the exit.
+    /// Syscalls whose completion can make another thread runnable.
+    fn may_wake_syscall(nr: u64, ret: i64, arg2: u64) -> bool {
+        const FUTEX: u64 = 202;
+        const FUTEX_WAITV: u64 = 449;
+        match nr {
+            FUTEX => ret > 0 && matches!(arg2 & 0x7f, 1 | 3 | 4 | 5 | 7 | 10 | 12),
+            FUTEX_WAITV => false,
+            // write, pwrite64, writev, sendto, sendmsg, pwritev, sendmmsg, pwritev2, splice, tee, vmsplice, sendfile
+            1 | 18 | 20 | 44 | 46 | 296 | 307 | 328 | 275 | 276 | 278 | 40 => ret > 0,
+            // kill, tkill, tgkill, rt_sigqueueinfo, rt_tgsigqueueinfo, pidfd_send_signal
+            62 | 200 | 234 | 129 | 297 | 424 => ret == 0,
+            // close, shutdown, unlink*, rename*, semop/semtimedop, msgsnd, mq_timedsend, flock, fcntl, epoll_ctl, timerfd_settime, eventfd write (above), exit, exit_group, munmap (unlikely), ioctl (tty)
+            3 | 48 | 87 | 263 | 82 | 264 | 65 | 220 | 69 | 242 | 73 | 72 | 233 | 286 | 60 | 231 | 16 => true,
+            _ => false,
+        }
+    }
+
+    pub fn task_vanished(&mut self, tid: pid_t) -> Result<()> {
+        let t = self.task_mut(tid)?;
+        t.vblock = None;
+        t.vwait = None;
+        t.vdeadline = None;
+        if let Some(st) = ptrace::wait_tid(tid)? {
+            t.did_wait(st)?;
+        } else {
+            t.state = State::Exited;
+        }
+        t.unreported = true;
+        Ok(())
     }
 
     /// Exit code of the main process, if it exited.
@@ -772,7 +825,18 @@ impl Session {
             // to the tracer for every ptrace stop) rather than polling; the
             // timeout bounds how long a syscall may run before we look at
             // whether it is blocked.
-            let grace = if self.replay { self.opts.deadlock_timeout } else { self.opts.block_grace };
+            // A thread asleep in a syscall only another (stopped) tracee or
+            // a virtual timer can end is blocked the moment it sleeps: no
+            // real-time grace, so the classification does not depend on
+            // machine load.  External I/O (sockets to the outside, devices)
+            // may complete by itself after a short sleep and keeps the grace.
+            let grace = if self.replay {
+                self.opts.deadlock_timeout
+            } else if self.task(tid)?.block_class == crate::task::BlockClass::Tracee {
+                Duration::ZERO
+            } else {
+                self.opts.block_grace
+            };
             let timeout = if allow_block {
                 let since = *sleeping_since.get_or_insert_with(Instant::now);
                 grace.saturating_sub(since.elapsed()).max(Duration::from_micros(20))
@@ -986,6 +1050,31 @@ impl Session {
         v
     }
 
+    /// A woken thread needs the kernel to run it to its next ptrace stop;
+    /// until then it still looks blocked.  Whether its stop has arrived by
+    /// the next scheduling decision depends on machine load, so after a
+    /// step that can wake someone (see `may_wake`) the stops in flight are
+    /// waited for, bounded, before the enabled set is read.
+    pub fn wait_wakes(&mut self) -> Result<()> {
+        if !std::mem::take(&mut self.wake_pending) {
+            return Ok(());
+        }
+        let start = Instant::now();
+        let bound = if self.replay { self.opts.deadlock_timeout } else { Duration::from_millis(500) };
+        loop {
+            let in_flight = self
+                .tasks
+                .values()
+                .filter(|t| matches!(t.state, State::Blocked { .. }) && t.vblock.is_none() && t.vwait.is_none())
+                .any(|t| matches!(ptrace::proc_state(t.tid), Some('R') | Some('t') | Some('T')));
+            if !in_flight || start.elapsed() >= bound {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_micros(20));
+            self.settle()?;
+        }
+    }
+
     /// Replay: wait (real time) for a blocked thread's syscall to complete,
     /// without jumping the virtual clock.  Returns false on timeout.
     pub fn wait_for_completion(&mut self) -> Result<bool> {
@@ -1014,6 +1103,16 @@ impl Session {
             }
             // A wakeup in flight is not idleness.
             if self.wait_in_flight()? {
+                continue;
+            }
+            // The main process has exited: its remaining threads are being
+            // killed by the kernel (exit_group), not sleeping.  Their
+            // virtual deadlines are void; wait for their exit events.
+            if self.main_exit_code().is_some() {
+                if start.elapsed() > self.opts.deadlock_timeout {
+                    return Ok(false);
+                }
+                std::thread::sleep(Duration::from_micros(100));
                 continue;
             }
             // Virtual time: jump to the next deadline instead of waiting.
@@ -1125,7 +1224,12 @@ impl Session {
             let mut budget = budget;
             match stop {
                 Stop::SyscallEntry { nr } => {
-                    allow_block = crate::effects::may_block(self.task_mut(tid)?, nr)?;
+                    let peers = std::mem::take(&mut self.socket_peers);
+                    let class = crate::effects::block_class(self.task_mut(tid)?, nr, &peers);
+                    self.socket_peers = peers;
+                    let class = class?;
+                    self.task_mut(tid)?.block_class = class;
+                    allow_block = class != crate::task::BlockClass::Never;
                     budget = 0;
                     self.pre_syscall(tid, nr)?;
                 }
@@ -1294,6 +1398,9 @@ impl Session {
                 // The event carries the value the program sees, which the
                 // virtualization above may have changed.
                 let ret = self.task_mut(tid)?.regs()?.rax as i64;
+                if Self::may_wake_syscall(nr, ret, self.task_mut(tid)?.regs()?.rsi) {
+                    self.wake_pending = true;
+                }
                 if nr == SOCKETPAIR && ret == 0 {
                     // Remember which sockets are peers, so that a checkpoint
                     // can recreate the pair.
@@ -2320,8 +2427,107 @@ impl Session {
     /// `syscall` instruction or any other event.  Returns `Preempt` if the
     /// steps completed.
     pub fn step_instructions(&mut self, ltid: Ltid, n: u32) -> Result<Event> {
+        self.step_instructions_while(ltid, n, |_| true)
+    }
+
+    /// Run `ltid` for exactly `budget` ticks: the counter is armed
+    /// `EXACT_MARGIN` ticks early (the interrupt's skid is smaller than
+    /// that except under extreme load) and the last window is covered by
+    /// block-stepping (one stop per taken branch), so the preemption lands
+    /// at the first stop with the target count, a function of the program
+    /// alone.  A syscall instruction ends the slice before it is executed
+    /// (block-stepping would run the syscall unobserved); any other event
+    /// (watchpoint, signal, exit) is reported as usual.
+    pub fn run_task_exact(&mut self, ltid: Ltid, budget: u64) -> Result<Event> {
+        let tid = self.tid_of(ltid)?;
+        if self.task(tid)?.unreported || !self.task(tid)?.is_stopped() {
+            return self.run_task(ltid, 0);
+        }
+        let target = self.task(tid)?.ticks + budget;
+        let margin = EXACT_MARGIN.min(self.pmu.skid.max(64));
+        if budget > margin {
+            let ev = self.run_task(ltid, budget - margin)?;
+            if ev != Event::Preempt || self.watch_preempt {
+                return Ok(ev);
+            }
+            if self.task(tid)?.ticks >= target {
+                self.exact_overshoots += 1;
+            }
+        } else {
+            self.vclock.events += 1;
+            self.watch_preempt = false;
+        }
+        loop {
+            let t = self.task_mut(tid)?;
+            if t.ticks >= target || !t.is_stopped() || t.pending_sig != 0 {
+                break;
+            }
+            // Only user code between events is stepped.  A thread at a
+            // syscall entry (or any other bookkeeping stop) is run through
+            // it by `run_task`, which does the interception and emulation.
+            if !matches!(t.stop(), Some(Stop::Parked) | Some(Stop::Signal { .. }) | Some(Stop::SyscallExit { .. })) {
+                return self.run_task(ltid, 0);
+            }
+            let rip = t.rip();
+            // A block step runs every instruction up to the next taken
+            // branch, a syscall among them unobserved (no syscall stop):
+            // look for the opcode in the straight-line code ahead and
+            // single-step that stretch instead (a false match inside an
+            // operand only costs steps).
+            let mut ahead = [0u8; EXACT_SCAN];
+            let n = t.mem.read_partial(rip, &mut ahead);
+            let next_syscall = ahead[..n].windows(2).position(|w| w == ptrace::SYSCALL_INSN).map(|o| rip + o as u64);
+            if next_syscall == Some(rip) || n < 2 {
+                break;
+            }
+            let how = if next_syscall.is_some() { ResumeHow::SingleStep } else { ResumeHow::BlockStep };
+            t.resume(how, 0)?;
+            match self.wait_task(tid, false)? {
+                WaitOutcome::Exited => {
+                    let code = self.task(tid)?.exit_code.unwrap_or(0);
+                    return Ok(Event::Exited { code });
+                }
+                WaitOutcome::Blocked => {
+                    let nr = self.task(tid)?.syscall_nr;
+                    return Ok(Event::Blocked { nr });
+                }
+                WaitOutcome::Stopped(Stop::Signal { sig }) if sig == libc::SIGTRAP => {
+                    self.task_mut(tid)?.state = State::Stopped(Stop::Parked);
+                    if !self.watchpoints.is_empty() {
+                        let bits = crate::watch::watchpoint_hits(tid);
+                        if bits != 0 {
+                            self.watch_account(bits)?;
+                            self.watch_preempt = true;
+                            break;
+                        }
+                    }
+                }
+                WaitOutcome::Stopped(Stop::Signal { sig }) if sig == TIME_SLICE_SIGNAL => {
+                    // A late overflow of the early budget: suppressed.
+                    let t = self.task_mut(tid)?;
+                    t.pending_sig = 0;
+                    t.state = State::Stopped(Stop::Parked);
+                }
+                WaitOutcome::Stopped(stop) => {
+                    if let Some(ev) = self.handle_stop(tid, stop)? {
+                        return Ok(ev);
+                    }
+                }
+            }
+        }
+        if !self.watchpoints.is_empty() {
+            self.watch_new_task(tid);
+        }
+        Ok(Event::Preempt)
+    }
+
+    /// Single-step up to `n` instructions while `go(task)` holds.
+    fn step_instructions_while(&mut self, ltid: Ltid, n: u32, go: impl Fn(&Task) -> bool) -> Result<Event> {
         let tid = self.tid_of(ltid)?;
         for _ in 0..n {
+            if !go(self.task(tid)?) {
+                break;
+            }
             let t = self.task_mut(tid)?;
             if !t.is_stopped() || t.pending_sig != 0 {
                 break;

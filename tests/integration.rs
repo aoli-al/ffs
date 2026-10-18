@@ -743,3 +743,25 @@ fn signal_shortened_syscall_results_replay() {
     assert_eq!(out.status.code(), Some(0), "{text}");
     assert!(text.contains("replayed all"), "{text}");
 }
+
+/// A child's exit as the kernel shows it to the tracee (pidfd readable,
+/// pid still valid until waited for) must agree with the emulated process
+/// tree: `pidfd_open`/`kill` on a reaped zombie, `waitpid(WNOHANG)` right
+/// after a pidfd poll, and SIGKILL of a process blocked in an emulated wait.
+#[test]
+fn process_tree_agrees_with_the_kernel() {
+    build_tests();
+    if !pmu_ok() {
+        return;
+    }
+    for name in ["pidfd_wait", "zombie_pid", "kill_waiter", "exit_while_sleeping"] {
+        let out_dir = tmpdir(&format!("ptree-{name}"));
+        let (out, text) = run(ffs()
+            .args(["explore", "--iterations", "20", "--keep-going", "--output-dir"])
+            .arg(&out_dir)
+            .arg("--")
+            .arg(prog(name)));
+        assert_eq!(out.status.code(), Some(0), "{name}: {text}");
+        assert!(text.contains("explored 20 branches, 0 failing"), "{name}: {text}");
+    }
+}

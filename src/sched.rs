@@ -227,6 +227,9 @@ pub struct Random {
     pub max_slice: u64,
     /// Instructions to single-step after a tick budget (uniform 0..=max).
     pub max_steps: u32,
+    /// Probability of holding a thread back after a watchpoint hit.
+    pub watch_hold: f64,
+    hold: WatchHold,
 }
 
 impl Random {
@@ -245,6 +248,8 @@ impl Random {
             switch_prob,
             max_slice,
             max_steps,
+            watch_hold: 0.0,
+            hold: WatchHold::default(),
         }
     }
 }
@@ -256,10 +261,10 @@ impl Policy for Random {
         // continue, so that is a coin flip like any other event.
         let preempted = (matches!(ctx.last_event, Some(Event::Preempt | Event::Slice)) && !ctx.watch_preempt)
             || is_yield(ctx.last_event);
+        let held = self.hold.update(ctx, &mut self.rng, self.watch_hold);
+        let enabled: Vec<Ltid> = ctx.enabled.iter().copied().filter(|&l| Some(l) != held).collect();
         let keep = match ctx.current {
-            Some(c) if ctx.enabled.contains(&c) && !preempted => {
-                !self.rng.gen_bool(self.switch_prob)
-            }
+            Some(c) if enabled.contains(&c) && !preempted => !self.rng.gen_bool(self.switch_prob),
             _ => false,
         };
         let ltid = if keep {
@@ -267,16 +272,11 @@ impl Policy for Random {
         } else {
             // After a preemption always move to a different thread if there
             // is one: that is the whole point of preempting.
-            let others: Vec<Ltid> = ctx
-                .enabled
-                .iter()
-                .copied()
-                .filter(|&l| Some(l) != ctx.current)
-                .collect();
-            if preempted && !others.is_empty() {
+            let others: Vec<Ltid> = enabled.iter().copied().filter(|&l| Some(l) != ctx.current).collect();
+            if (preempted || held.is_some()) && !others.is_empty() {
                 others[self.rng.gen_range(0..others.len())]
             } else {
-                ctx.enabled[self.rng.gen_range(0..ctx.enabled.len())]
+                enabled[self.rng.gen_range(0..enabled.len())]
             }
         };
         let mut budget = if self.max_budget > 0 && self.rng.gen_bool(self.preempt_prob) {
@@ -306,6 +306,8 @@ pub struct Pct {
     pub max_budget: u64,
     pub max_slice: u64,
     pub max_steps: u32,
+    /// Probability that a watchpoint hit acts as a priority change point.
+    pub watch_hold: f64,
     priorities: std::collections::BTreeMap<Ltid, i64>,
     change_points: Vec<usize>,
     step: usize,
@@ -327,6 +329,7 @@ impl Pct {
             max_budget,
             max_slice,
             max_steps,
+            watch_hold: 0.0,
             priorities: Default::default(),
             change_points,
             step: 0,
@@ -347,7 +350,12 @@ impl Policy for Pct {
         if let Some(c) = ctx.current {
             // A change point, or a yield: strict priorities would otherwise
             // let a thread spinning on `sched_yield` starve everyone else.
-            if self.change_points.contains(&self.step) || is_yield(ctx.last_event) || ctx.spin_level > 0 {
+            // A watchpoint hit is also one with probability `watch_hold`:
+            // the thread is inside a read-modify-write of shared state, and
+            // dropping its priority lets another thread reach the
+            // conflicting access first.
+            let watch_hit = ctx.watch_preempt && self.watch_hold > 0.0 && self.rng.gen_bool(self.watch_hold);
+            if self.change_points.contains(&self.step) || is_yield(ctx.last_event) || ctx.spin_level > 0 || watch_hit {
                 self.lowest -= 1;
                 self.priorities.insert(c, self.lowest);
             }
@@ -840,6 +848,45 @@ pub struct PolicyParams {
     pub watch: Vec<String>,
     /// Globals sampled per branch when `watch` is empty.
     pub watch_count: u32,
+    /// Probability of holding a thread back after a watchpoint hit.
+    pub watch_hold: f64,
+}
+
+/// Events a thread held back after a watchpoint hit stays unscheduled.
+const WATCH_HOLD_EVENTS: usize = 64;
+
+/// Active-testing style delay (cf. RaceFuzzer): a thread stopped by a
+/// watchpoint is inside a read-modify-write of shared state, so holding it
+/// there lets another thread reach the conflicting access.  The hold ends
+/// when another thread hits a watchpoint (the racing pair is formed; the
+/// policy's normal choice then decides who goes first), after
+/// `WATCH_HOLD_EVENTS`, or when nothing else can run.
+#[derive(Default)]
+struct WatchHold {
+    held: Option<(Ltid, usize)>,
+}
+
+impl WatchHold {
+    /// Update on an event; returns the thread to keep off the enabled set.
+    fn update(&mut self, ctx: &SchedContext, rng: &mut ChaCha8Rng, prob: f64) -> Option<Ltid> {
+        if let Some((h, left)) = self.held {
+            let formed = ctx.watch_preempt && ctx.current != Some(h);
+            let alone = ctx.enabled.iter().all(|&l| l == h);
+            if formed || alone || left == 0 || !ctx.enabled.contains(&h) {
+                self.held = None;
+            } else {
+                self.held = Some((h, left - 1));
+            }
+        }
+        if self.held.is_none() && prob > 0.0 && ctx.watch_preempt {
+            if let Some(c) = ctx.current {
+                if ctx.enabled.iter().any(|&l| l != c) && rng.gen_bool(prob) {
+                    self.held = Some((c, WATCH_HOLD_EVENTS));
+                }
+            }
+        }
+        self.held.map(|(h, _)| h)
+    }
 }
 
 /// `branch` selects the member of a policy portfolio (`mix` alternates
@@ -862,15 +909,16 @@ pub fn make_branch_policy(p: &PolicyParams, seed: u64, expected_steps: usize, br
     Ok(match name {
         "fifo" => Box::new(Fifo::new(p.max_slice)),
         "rr" | "round-robin" => Box::new(RoundRobin { max_slice: p.max_slice }),
-        "random" => Box::new(Random::new(
-            seed,
-            p.preempt_prob,
-            p.max_budget,
-            p.switch_prob,
-            p.max_slice,
-            p.max_steps,
-        )),
-        "pct" => Box::new(Pct::new(seed, p.pct_depth, expected_steps, p.preempt_prob, p.max_budget, p.max_slice, p.max_steps)),
+        "random" => {
+            let mut r = Random::new(seed, p.preempt_prob, p.max_budget, p.switch_prob, p.max_slice, p.max_steps);
+            r.watch_hold = p.watch_hold;
+            Box::new(r)
+        }
+        "pct" => {
+            let mut r = Pct::new(seed, p.pct_depth, expected_steps, p.preempt_prob, p.max_budget, p.max_slice, p.max_steps);
+            r.watch_hold = p.watch_hold;
+            Box::new(r)
+        }
         other => bail!("unknown policy {other}"),
     })
 }

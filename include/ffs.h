@@ -26,6 +26,7 @@ extern "C" {
 #define FFS_SYS_ACTIVE      (FFS_SYS_BASE + 5)  /* () -> 1 under ffs, -ENOSYS otherwise */
 #define FFS_SYS_BEGIN       (FFS_SYS_BASE + 6)  /* () -> 0 ; start of the region to explore */
 #define FFS_SYS_END         (FFS_SYS_BASE + 7)  /* () -> 0 ; end of the region to explore */
+#define FFS_SYS_WATCH       (FFS_SYS_BASE + 8)  /* (const void* addr, size_t len) -> 0 */
 
 /* Create a checkpoint of the whole process here.  Under `ffs explore` the
  * exploration tree is rooted at the most recent checkpoint; under `ffs record`
@@ -60,6 +61,13 @@ static inline int ffs_is_active(void) {
  * stops exploring a branch at ffs_end(). */
 static inline long ffs_begin(void) { return syscall(FFS_SYS_BEGIN); }
 static inline long ffs_end(void) { return syscall(FFS_SYS_END); }
+
+/* Ask `ffs explore` to put a hardware watchpoint on the 8-byte slots of
+ * [addr, addr+len) in every branch (4 slots in total): for shared state on
+ * the heap, which has no symbol for --watch.  Call it before the root. */
+static inline long ffs_watch(const void* addr, size_t len) {
+  return syscall(FFS_SYS_WATCH, addr, len);
+}
 
 #ifdef __cplusplus
 }

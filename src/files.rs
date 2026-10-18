@@ -165,7 +165,17 @@ impl Session {
                 }
                 Some((_, u32::MAX)) => {}
                 Some((data, mode)) => {
-                    if let Err(e) = std::fs::write(&path, &data) {
+                    let mut written = std::fs::write(&path, &data);
+                    if matches!(&written, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+                        // The branch removed the directory too (a tempdir
+                        // cleaned up at exit): recreate it, the snapshot
+                        // predates the removal.
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        written = std::fs::write(&path, &data);
+                    }
+                    if let Err(e) = written {
                         log::warn!("cannot restore {}: {e}", path.display());
                         continue;
                     }

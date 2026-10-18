@@ -61,6 +61,7 @@ syscall with a number Linux does not implement, so natively it returns
 | `ffs_yield()` | extra scheduling point |
 | `ffs_log("msg")` | print through the tracer |
 | `ffs_is_active()` | 1 under ffs |
+| `ffs_watch(addr, len)` | hardware-watch these 8-byte slots in every branch (heap state with no symbol; before the root) |
 
 Programs that do not use the header are explored from their start (or from
 `--root vtime:SECS`, see below); crashes (`abort()` from a failed `assert`,
@@ -125,6 +126,22 @@ preemption inside user code:
 
 All three are recorded as ordinary `Preempt` steps at `(ticks, rip)`, so a
 replay needs none of them.
+
+Shared state that lives on the heap (an `Arc<Cache>`, a C++ object) has no
+symbol, but its address is the same in every run under ffs (no ASLR, virtual
+randomness, deterministic allocation order), so a program can print the
+address of the word it wants watched and the next `explore` can take it as
+`--watch 0x...` (tests/liquid-cache does this for a budget counter). A
+watchpoint alone stops one thread inside its read-modify-write window; the
+race also needs the *other* thread to reach the conflicting access while
+the first one sits there, and the random policy resumes the first thread
+at the next coin flip. `--watch-hold P` is the active-testing answer
+(RaceFuzzer's delay): with probability P the thread stopped by a watchpoint
+is held off the runnable set, for up to 64 events or until another thread
+hits a watchpoint (the racing pair is formed); under PCT the hit acts as a
+priority change point. liquid-cache's double-accounting race (two readers
+hydrating the same entry) is found in 3 of 4 schedules with a watchpoint
+on the counter and `--watch-hold 0.7`, and in none of 1600 without.
 
 ### Deadlocks and hangs
 
@@ -262,7 +279,14 @@ The following facilities are controlled:
   is snapshotted before the syscall and put back when the branch ends, and
   files already open for writing at the root are snapshotted at the start
   of every branch. Every branch therefore starts from the same files, and
-  the working directory is left as the exploration found it.
+  the working directory is left as the exploration found it. A directory
+  the branch removed around such a file (a `tempdir` cleaned up at exit) is
+  recreated for the restore. Directory *names* are a different matter: with
+  virtual randomness a `tempfile::tempdir()` gets the same name in every
+  run, so a second run finds the first run's directory (if it was kept) and
+  takes a different path through `mkdir` (`EEXIST`, retry), which a replay
+  then does not reproduce; programs under test should take the directory
+  as an argument.
 
 ### Shadow replay
 
@@ -356,7 +380,9 @@ kernel state was identical.
 
 Asynchronous-memory interfaces (`io_setup`, `io_submit`, `io_uring_*`,
 `userfaultfd`, `perf_event_open`) return `ENOSYS` under
-ffs.
+ffs. Libraries usually have a fallback (liquid-cache's `t4` store has a
+thread-pool backend behind a cargo feature) but the fallback is what gets
+tested, not the io_uring path.
 Inherited asynchronous resources and direct hardware randomness are not
 covered by these syscall guards.
 
@@ -570,6 +596,22 @@ scheduler (bounded 100k-tick slices whenever another thread exists, and a
 spin detector that shrinks a spinning thread's slices and demotes it under
 PCT), and deadlock detection beside timer threads.
 
+## A Rust library: liquid-cache (`tests/liquid-cache/`)
+
+`tests/liquid-cache/` tests [liquid-cache](https://github.com/datafusion-contrib/liquid-cache),
+a DataFusion cache written in Rust (tokio, a lock-free ART index, an
+atomic budget, a key-value store with its own I/O threads). A small harness
+(`harness/src/main.rs`, built against a checkout by `run.py setup`) runs
+scripted or random cache operations from several threads and checks the
+cache's own invariants with `ffs_assert`; `ffs explore` supplies the
+interleavings. Its README lists what was found: a disk-budget leak that is
+not even a race, a time-of-check/time-of-use window in the index/budget
+update that double-charges or under-charges the memory budget (until the
+counter wraps and the cache rejects every insert), a torn read of an entry
+being rewritten under the same key, and an iteration that panics when an
+entry is removed under it. The minimal two-thread versions of the budget
+races needed hardware watchpoints on a heap word plus `--watch-hold`.
+
 ## Results on rr's test suite
 
 `tests/rr/` runs rr's own test programs under `ffs record`/`ffs replay`;
@@ -680,5 +722,6 @@ tests/c/           example programs with concurrency bugs and fidelity checks
                    (deadlock_timer: a deadlock beside a periodic thread)
 tests/java/        JNI shim, Flink's FutureCompletingBlockingQueue, FLINK-37663 harness
 tests/flink/       Flink's published test classes under ffs (pom, run.py)
+tests/liquid-cache/ harness + run.py for the liquid-cache Rust library
 tests/integration.rs
 ```

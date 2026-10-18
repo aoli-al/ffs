@@ -148,6 +148,13 @@ struct PolicyOpts {
     /// Probability of switching threads at an event.
     #[arg(long, default_value_t = 0.5)]
     switch_prob: f64,
+    /// Probability that a thread stopped by a watchpoint is held back (not
+    /// scheduled while others are runnable, for up to 64 events or until
+    /// another thread hits a watchpoint), so that a second thread can reach
+    /// the conflicting access while the first sits inside its
+    /// read-modify-write window.  0 disables this (the default).
+    #[arg(long, default_value_t = 0.0)]
+    watch_hold: f64,
     /// Maximum ticks a thread may run while others are runnable (0 =
     /// unlimited).  100k ticks cost about as much as the scheduling step
     /// itself, and bound what a busy-waiting thread burns per slice (a
@@ -550,6 +557,7 @@ impl From<PolicyOpts> for sched::PolicyParams {
             pct_depth: p.pct_depth,
             watch: p.watch,
             watch_count: p.watch_count,
+            watch_hold: p.watch_hold,
         }
     }
 }

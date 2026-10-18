@@ -827,6 +827,7 @@ impl Session {
             exited_procs: self.exited_procs.clone(),
             socket_peers: self.socket_peers.clone(),
             watchpoints: Vec::new(),
+            watch_requests: self.watch_requests.clone(),
             watch_pending: Default::default(),
             watch_hits: [0; 4],
             watch_disabled: 0,

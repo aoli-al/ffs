@@ -265,6 +265,12 @@ impl Explorer {
     /// sample of the executable's writable globals.
     fn watch_branch(&mut self, session: &mut Session) -> Result<()> {
         let mut addrs = self.fixed_watch.clone();
+        // Slots the program registered with ffs_watch() before the root.
+        for &a in &self.root.watch_requests {
+            if !addrs.contains(&a) && addrs.len() < 4 {
+                addrs.push(a);
+            }
+        }
         if addrs.is_empty() && self.params.watch_count > 0 && !self.globals.is_empty() {
             // Distinct 8-byte slots covered by the globals (neighbouring
             // small variables share one).

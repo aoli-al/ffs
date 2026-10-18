@@ -191,6 +191,9 @@ pub struct Session {
     pub socket_peers: BTreeMap<u64, u64>,
     /// Addresses watched with hardware watchpoints (see `watch.rs`).
     pub watchpoints: Vec<u64>,
+    /// 8-byte slots the program asked to have watched (`ffs_watch`): heap
+    /// words that have no symbol.  `explore` adds them to every branch.
+    pub watch_requests: Vec<u64>,
     /// Threads that still need their debug registers programmed.
     pub watch_pending: std::collections::BTreeSet<pid_t>,
     /// Hits per watchpoint slot in this execution, and slots disabled
@@ -563,6 +566,7 @@ impl Session {
             exited_procs: std::collections::BTreeSet::new(),
             socket_peers: BTreeMap::new(),
             watchpoints: Vec::new(),
+            watch_requests: Vec::new(),
             watch_pending: Default::default(),
             watch_hits: [0; 4],
             watch_disabled: 0,
@@ -1750,6 +1754,23 @@ impl Session {
             },
             MagicCall::Begin => Event::Begin,
             MagicCall::End => Event::End,
+            MagicCall::Watch => {
+                // Every 8-byte slot of [addr, addr+len), at most the 4 debug
+                // registers in total.
+                let (addr, len) = (r.rdi, r.rsi.max(1));
+                let ltid = t.ltid;
+                let mut a = addr & !7;
+                while a < addr + len && self.watch_requests.len() < 4 {
+                    if !self.watch_requests.contains(&a) {
+                        self.watch_requests.push(a);
+                    }
+                    a += 8;
+                }
+                log::info!("T{ltid}: ffs_watch({addr:#x}, {len})");
+                Event::SyscallEntry {
+                    nr: ffs_api::FFS_SYS_WATCH,
+                }
+            }
         })
     }
 

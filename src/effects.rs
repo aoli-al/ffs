@@ -13,7 +13,36 @@ use crate::task::{Ltid, Task};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Output {
     pub addr: u64,
+    /// The bytes themselves, up to `INLINE_BYTES` (enough to see what was read).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bytes: Vec<u8>,
+    /// For larger buffers, (length, FNV-1a 64 hash) instead: a test that
+    /// moves blobs around would otherwise record gigabytes of JSON, and a
+    /// replay only needs to know whether the bytes were the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<(usize, u64)>,
+}
+
+/// Largest output stored byte for byte.
+pub const INLINE_BYTES: usize = 512;
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+impl Output {
+    pub fn new(addr: u64, bytes: Vec<u8>) -> Output {
+        if bytes.len() > INLINE_BYTES {
+            Output { addr, digest: Some((bytes.len(), fnv1a64(&bytes))), bytes: Vec::new() }
+        } else {
+            Output { addr, bytes, digest: None }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,7 +56,7 @@ pub fn refused_syscall(nr: u64) -> bool {
     matches!(nr, 206 | 209 | 298 | 323 | 425 | 426 | 427)
 }
 
-fn metadata_query(nr: u64) -> bool {
+pub fn metadata_query(nr: u64) -> bool {
     // stat/fstat/lstat, uname, readlink, sysinfo, statfs/fstatfs,
     // newfstatat, readlinkat, statx. These do not advance fd state.
     matches!(nr, 4 | 5 | 6 | 63 | 89 | 99 | 137 | 138 | 262 | 267 | 332)
@@ -155,7 +184,7 @@ pub fn capture(session: &mut Session, ltid: Ltid, event: &Event) -> Result<Optio
     for (addr, len) in ranges(t, &r, *nr, *ret)? {
         let mut bytes = vec![0; len];
         t.mem.read(addr, &mut bytes)?;
-        out.push(Output { addr, bytes });
+        out.push(Output::new(addr, bytes));
     }
     Ok(Some(Effects { out }))
 }

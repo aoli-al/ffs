@@ -39,9 +39,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(argv[1], "timerfd")) {
-        errno = 0;
-        assert(syscall(SYS_timerfd_create, 1, 0) == -1);
-        assert(errno == ENOSYS);
+        /* timerfds run on the virtual clock (see timerfd_loop.c). */
+        int fd = syscall(SYS_timerfd_create, 1, 0);
+        assert(fd >= 0);
+        close(fd);
         return 0;
     }
     if (!strcmp(argv[1], "pipe")) {

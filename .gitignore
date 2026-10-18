@@ -3,3 +3,7 @@
 .direnv
 *.o
 /tests/bin
+/tests/flink/classpath.txt
+/tests/flink/classes-*.txt
+/tests/flink/results
+/tests/flink/target

@@ -308,6 +308,7 @@ pub fn interrupting_signals(tid: pid_t) -> u64 {
 }
 
 pub fn tgkill(tgid: pid_t, tid: pid_t, sig: i32) -> Result<()> {
+    note_signal_sent();
     if unsafe { libc::syscall(libc::SYS_tgkill, tgid, tid, sig) } < 0 {
         bail!("tgkill({tgid}, {tid}, {sig}): {}", std::io::Error::last_os_error());
     }
@@ -406,7 +407,71 @@ pub fn try_wait_tid(tid: pid_t) -> Result<Option<WaitStatus>> {
     wait_impl(tid, libc::WNOHANG)
 }
 
+thread_local! {
+    /// Wait statuses collected by `drain_statuses` (one `waitpid(-1)` sweep
+    /// instead of one `waitpid` per thread) and not yet handed out.  Every
+    /// wait goes through `wait_impl`, which looks here first, so a status
+    /// swept up for a thread someone else is waiting for is not lost.
+    static STASH: std::cell::RefCell<std::collections::HashMap<pid_t, std::collections::VecDeque<WaitStatus>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Collect every wait status currently available for any child or tracee.
+pub fn drain_statuses() -> Result<()> {
+    loop {
+        let mut status: i32 = 0;
+        let r = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
+        if r == -1 {
+            let e = errno();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            if e.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(());
+            }
+            return Err(anyhow!("waitpid(-1) failed: {e}"));
+        }
+        if r == 0 {
+            return Ok(());
+        }
+        STASH.with(|st| st.borrow_mut().entry(r).or_default().push_back(WaitStatus::decode(status)));
+    }
+}
+
+/// Put a status back for a later wait.
+pub fn stash(tid: pid_t, st: WaitStatus) {
+    STASH.with(|s| s.borrow_mut().entry(tid).or_default().push_front(st));
+}
+
+/// A status `drain_statuses` collected for `tid`, if any (no syscall).
+pub fn take_stashed(tid: pid_t) -> Option<WaitStatus> {
+    STASH.with(|st| {
+        let mut st = st.borrow_mut();
+        let q = st.get_mut(&tid)?;
+        let v = q.pop_front();
+        if q.is_empty() {
+            st.remove(&tid);
+        }
+        v
+    })
+}
+
+/// Signals sent to tracees since the start (by tracees or by the tracer):
+/// a parked sleeper only needs its pending set re-read when this changed.
+pub static SIG_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn note_signal_sent() {
+    SIG_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn sig_epoch() -> u64 {
+    SIG_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn wait_impl(tid: pid_t, extra: i32) -> Result<Option<WaitStatus>> {
+    if let Some(st) = take_stashed(tid) {
+        return Ok(Some(st));
+    }
     loop {
         let mut status: i32 = 0;
         let r = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | extra) };

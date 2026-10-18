@@ -62,9 +62,9 @@ syscall with a number Linux does not implement, so natively it returns
 | `ffs_log("msg")` | print through the tracer |
 | `ffs_is_active()` | 1 under ffs |
 
-Programs that do not use the header are explored from their start; crashes
-(`abort()` from a failed `assert`, segfaults), deadlocks and non-zero exits
-count as failures.
+Programs that do not use the header are explored from their start (or from
+`--root vtime:SECS`, see below); crashes (`abort()` from a failed `assert`,
+segfaults), deadlocks, hangs and non-zero exits count as failures.
 
 ### Exploring
 
@@ -101,6 +101,13 @@ Strategies (`--strategy`):
   `--max-checkpoints`), so backtracking is a fork; beyond the budget the path is
   re-executed from the nearest checkpoint (and verified to be deterministic).
 
+A thread runs at most `--max-slice` ticks (100k) while any other thread
+exists, so a thread that another one has just woken is picked up within a
+slice. A thread whose consecutive slices all end by tick budget in the same
+code page is taken to be busy-waiting: its slices shrink (down to 16k
+ticks), and PCT and FIFO treat its preemptions as yields, so a spinner
+neither burns virtual time nor starves lower-priority threads.
+
 Scheduling points are syscalls, `ffs_yield()`, and three kinds of
 preemption inside user code:
 
@@ -118,6 +125,53 @@ preemption inside user code:
 
 All three are recorded as ordinary `Preempt` steps at `(ticks, rip)`, so a
 replay needs none of them.
+
+### Deadlocks and hangs
+
+A program is deadlocked when no thread can run and no virtual deadline is
+pending. Programs with timer threads (every JVM has several that wake every
+few milliseconds) are never in that state, so `ffs` also infers a deadlock
+from the absence of progress: some thread waits with no timeout, and for
+`--deadlock-wakes` (200) consecutive wakeups and `--deadlock-vtime` (30)
+virtual seconds every wakeup was caused by a virtual deadline alone. Progress
+is a blocked thread being woken by someone else (a futex wake, data on a
+pipe, a child exiting), which resets the count; a thread that only just
+started an untimed wait is not counted until its wait is that old, so a
+long one-shot sleep next to a periodic thread is not a deadlock. A timed
+waiter or timer counts as housekeeping only after three deadline wakeups
+in the window; one with fewer and a pending deadline (a 60 s timeout task)
+defers the verdict until it fires. The report
+names the stranded threads and the timer-driven ones:
+
+```
+[ffs] DEADLOCK: T1 T3 T4 blocked with no timeout; for 30.0 virtual seconds (600 wakeups) only the timer-driven threads T2 ran
+```
+
+A run that has neither ended nor deadlocked after `--max-vtime` (300)
+virtual seconds is a **hang** (exit code 7): the report lists the runnable
+threads (a livelock, if any) and the blocked ones. Virtual time advances
+about a nanosecond per conditional branch plus whatever the program sleeps,
+so compute-bound programs do not reach the limit; idle or spinning ones do
+within a second or two of real time. Both detectors are deterministic
+functions of the schedule, so their outcomes replay.
+
+### Choosing a root without the API
+
+`--root vtime:SECS` checkpoints at the first scheduling point after SECS of
+virtual time, `--root steps:N` after N scheduling steps, and
+`--root real:SECS` after SECS of wall-clock time (where that lands depends
+on machine speed, but the recorded prefix replays). To pick the value, run
+the program once with `ffs record --timeline`:
+
+```
+[ffs] virtual time 0.048 s (wall 0.9 s), 16 threads
+[ffs] timeline (virtual s): T1 at 0.000, T2 at 0.018, T3 at 0.022, ..., T16 at 0.046
+[ffs] first write to stdout/stderr at 0.048 s
+```
+
+For a JVM the whole startup is a few tens of virtual milliseconds (it is
+mostly computation, counted at a nanosecond per branch), so `--root
+vtime:0.045` roots just before the test threads of this harness appear.
 
 Other useful options: `--root start|begin|checkpoint|auto`, `--keep-going`,
 `-v` (print every scheduling step), `--ticks insns|none` (fallback tick
@@ -144,7 +198,12 @@ The following facilities are controlled:
   `poll`/`ppoll`, `select`/`pselect6`, `epoll_wait`/`epoll_pwait[2]`,
   `rt_sigtimedwait` and `futex_waitv` expire on the virtual clock, and
   `setitimer`/`alarm`/`timer_create` timers fire at a deterministic tick with
-  the `siginfo` the kernel would have produced. `getcpu` reports cpu 0 and
+  the `siginfo` the kernel would have produced. A `timerfd` (Netty's native
+  event loop, and so Flink's REST server, cannot run without one) keeps its
+  kernel timer disarmed; its deadline lives on the virtual clock, and when
+  it arrives ffs injects a one-shot immediate arm into a stopped thread of
+  the process (interrupting and re-executing a blocked `epoll_wait` if every
+  thread is in the kernel), so the descriptor becomes readable exactly then. `getcpu` reports cpu 0 and
   `rseq` is reported as unsupported, so no real cpu number leaks in.
 * **Randomness** (`--real-random` to disable). `getrandom`, reads from
   `/dev/urandom` and `/dev/random`, and the `AT_RANDOM` bytes the kernel puts
@@ -187,7 +246,11 @@ The following facilities are controlled:
   exits.
 * **The environment.** The environment and working directory of the
   recorded run are stored in the trace and used by `ffs replay`: the dynamic
-  loader and libc parse them, so they change tick counts.
+  loader and libc parse them, so they change tick counts. What stdin,
+  stdout and stderr are connected to is not stored: a program that asks
+  (`fcntl(F_GETFL)`, `isatty`) sees a terminal, a pipe and a file
+  differently, so a cold replay must be run with the same kinds of standard
+  descriptors as the recording.
 * **Loops without conditional branches** (`for(;;);`) never reach a tick
   budget; after `--slice-cap-ms` of real time such a thread is interrupted
   and that is recorded as a `Slice` preemption, which also advances the
@@ -214,7 +277,9 @@ Captured successful outputs currently cover native x86-64 `read`, `pread64`, `re
 `preadv`, `preadv2`, `process_vm_readv`, `getdents`, `getdents64`, `getrandom`, `stat`/`fstat`/
 `lstat`/`newfstatat`/`statx`, `readlink`/`readlinkat`, `uname`, `sysinfo`,
 `statfs`/`fstatfs`, `gettimeofday`, `time`, `clock_gettime`, and `clock_getres`.
-Buffers are stored inline in JSON, limited to 64 MiB per captured syscall.
+Buffers up to 512 bytes are stored inline in JSON; larger ones as their length
+and a 64-bit FNV-1a hash (a test moving blobs around would otherwise record
+gigabytes), limited to 64 MiB per captured syscall.
 Compat/i386 and x32 syscall entries are rejected before applying the native
 ABI output descriptions; syscall inspection requires Linux 5.3 or newer.
 Unsupported syscalls and partial memory writes from failed syscalls have no
@@ -243,6 +308,38 @@ Version 2 also records the tick source, slice-cap duration and use of a PID
 namespace. Replay restores those settings and rejects a mismatched PMU or an
 unavailable required PID namespace.
 
+Every step also records the virtual time it started at (`vt`). Whether the
+scheduler jumped the virtual clock while every thread was blocked depends on
+real I/O timing (a thread blocked in a disk read either completes before the
+next decision or does not), so a replay sets its clock from the trace before
+each step and never jumps on its own; a thread the trace says blocks is
+resumed and confirmed asleep in the kernel before the schedule moves on, so a
+subsequent wakeup finds it. `--verify-data` is `--verify-outputs` without the
+stat-family metadata (inode numbers, timestamps), which is live state by
+nature: it finds the input that made a program's control flow diverge.
+
+The kernel cuts some syscall results short when a signal is pending
+(`getdents64` returns a single entry, a pipe write stops between chunks),
+and ffs's own preemption signal is pending during a syscall whenever a tick
+budget expires at the `syscall` instruction. The trace shows this as a
+`Preempt` of the same thread at the same ticks and instruction right after
+the syscall exit; a replay then queues the signal before resuming into the
+syscall, so the kernel sees the same pending signal and returns the same
+short result (`Decision::RunPending`).
+
+A `bind` to port 0 gets a port ffs chooses (from 20000 up, outside the
+kernel's ephemeral range; a port the host has in use is retried with the
+next one, invisibly) instead of one the kernel picks: programs print, parse
+and send their ports to peers, so a kernel-chosen port is live input. The
+ports are stored in the trace and a replay binds the same ones.
+
+Some kernel-provided files are replaced by canonical copies in the tracee's
+`open` (see `canonical_file`): the cpu lists (one cpu), `/proc/self/mountinfo`,
+`/proc/self/mounts`, `/proc/self/cgroup`, `/proc/cgroups`, `/proc/stat` and
+`/proc/meminfo`. Their real contents change between runs (mount ids, counters)
+and programs parse them at startup: HotSpot's branch count through its
+mountinfo parser differed with the number of digits in a mount id.
+
 ### Remaining nondeterminism
 
 The seed does not determine host-timed slice preemptions, hardware overflow
@@ -259,8 +356,7 @@ kernel state was identical.
 
 Asynchronous-memory interfaces (`io_setup`, `io_submit`, `io_uring_*`,
 `userfaultfd`, `perf_event_open`) return `ENOSYS` under
-ffs. `timerfd_*` also return `ENOSYS` with virtual time, until their counters
-and readiness can be virtualized; `--real-time` allows native timerfds.
+ffs.
 Inherited asynchronous resources and direct hardware randomness are not
 covered by these syscall guards.
 
@@ -423,6 +519,17 @@ $ ffs replay ffs-out/fail-1.json          # cold replay, from JVM start
 | buggy | PCT | 100 | 100 |
 | fixed | random | 200 | 0 |
 
+With the argument `notimeout` the harness waits for producer B with no
+timeout, as a test without a watchdog would, and the failure is a real
+deadlock inside a JVM whose compiler, GC and periodic threads are all
+alive. The progress-based detector (see "Deadlocks and hangs") reports it
+after 30 virtual seconds of timer-only activity, within a second of real
+time:
+
+```
+[ffs] branch 2: FAILURE deadlock (blocked threads [1, 2, 4, 5, 6, 7, 12, 16]) after 3536 steps
+```
+
 Each branch is a fork of the JVM at the checkpoint and takes about 50 ms
 (a failing one waits 10 virtual seconds for B, which is instant in real
 time but lets the JVM's periodic tasks run). A plain `ffs record` of the
@@ -448,6 +555,20 @@ Running the JVM exposed three bugs in ffs, all fixed:
 * **`restart_syscall` labels.** A timed `poll` interrupted by the preemption
   signal is restarted by the kernel through `restart_syscall`; its exit was
   recorded with number 219 instead of the original call's.
+
+### Flink's own tests (`tests/flink/`)
+
+`tests/flink/run.py` runs Apache Flink's published test classes
+(`flink-connector-base`, `flink-core`, `flink-runtime` test jars from Maven
+Central) under ffs through JUnit's console launcher, without any change to
+Flink. `tests/flink/README.md` describes the setup and the four ffs problems
+that running `FutureCompletingBlockingQueueTest` exposed and fixed: tracer
+throughput (one `waitpid` sweep per step instead of one per thread, no
+`/proc` reads per step, a permanently enabled tick counter), the cost of
+instruction stepping on a JVM, busy-wait loops under a serializing
+scheduler (bounded 100k-tick slices whenever another thread exists, and a
+spin detector that shrinks a spinning thread's slices and demotes it under
+PCT), and deadlock detection beside timer threads.
 
 ## Results on rr's test suite
 
@@ -504,9 +625,8 @@ a second for `pbzip2` and `streamcluster2`.
 * x86-64 Linux only; needs a working PMU (`ffs check`). Inside most VMs there
   is no deterministic counter; `--ticks none` still gives syscall-level
   scheduling control and checkpoints, but no preemption.
-* External input is live: file contents, the network, the terminal, and
-  `timerfd`, which is not virtualized (a program blocked in `epoll_wait` on a
-  timerfd waits real time). Datagram socketpairs keep only their first
+* External input is live: file contents, the network, the terminal.
+  Datagram socketpairs keep only their first
   buffered datagram across a checkpoint; sockets connected by `connect()`
   rather than `socketpair()` stay shared with the original.
 * `/proc/self/exe`, `/proc/self/cmdline` and similar reflect the copy; CPU
@@ -515,9 +635,16 @@ a second for `pbzip2` and `streamcluster2`.
   about to exit or with a signal pending is run first by the explorer.
 * A run ends when the main process has exited (as `rr record` does): daemons
   it left behind are killed. A deadlock is reported only while it is alive.
-* Replaying a long busy loop is slow: the overflow interrupt lands up to
-  10,000 ticks late on AMD Zen (rr assumes the same), and each tick of that
-  window is replayed by breakpoint or single step.
+* The progress-based deadlock detector is a heuristic: a program whose only
+  activity for `--deadlock-wakes` wakeups is a periodic task that never wakes
+  another thread looks deadlocked to it (raise the thresholds), and it needs
+  virtual time (under `--real-time` only the all-blocked rule applies).
+* Replaying a preemption is slow in a tight loop: the overflow interrupt
+  can land up to 10,000 ticks late on AMD Zen (rr assumes the same), so the
+  counter is used in two stages (10,000 and then 3,000 ticks early) and the
+  last window is covered by a breakpoint on the target instruction, one
+  ptrace round trip per hit. A 630k-step JVM trace with 240k preemptions
+  replays in about 60 s against 16 s to record.
 * `exec` from a non-leader thread, 32-bit syscalls (`int 0x80`) and a
   program's own `ptrace` are not supported.
 * Whether a syscall is reported as `Blocked` or as completed is decided by
@@ -550,6 +677,8 @@ src/trace.rs       trace format
 src/vdso.rs        vDSO patching
 include/ffs.h      tracee-side API
 tests/c/           example programs with concurrency bugs and fidelity checks
+                   (deadlock_timer: a deadlock beside a periodic thread)
 tests/java/        JNI shim, Flink's FutureCompletingBlockingQueue, FLINK-37663 harness
+tests/flink/       Flink's published test classes under ffs (pom, run.py)
 tests/integration.rs
 ```

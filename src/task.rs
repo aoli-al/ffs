@@ -107,6 +107,21 @@ pub struct Task {
     /// An `Exit` event was reported for this task (replay bookkeeping for
     /// threads that die without an exit stop).
     pub exit_reported: bool,
+    /// `ptrace::sig_epoch()` when this parked sleeper's pending signals
+    /// were last examined.
+    pub sig_epoch_seen: u64,
+    /// The port ffs chose for a `bind` to port 0 in progress (see
+    /// `Session::net_pre_syscall`), and how often it was retried.
+    pub bound_port: Option<u16>,
+    pub port_tries: u8,
+    /// Replay: address of the execute breakpoint armed in `EXEC_SLOT`.
+    /// Disarmed by the next `resume` unless `keep_exec_bp` is set (by the
+    /// loop that hunts for a tick target).
+    pub exec_bp: Option<u64>,
+    pub keep_exec_bp: bool,
+    /// The session's watchpoints at the time they were applied to this
+    /// task (needed to program DR7 around the execute breakpoint).
+    pub watch_addrs: Vec<u64>,
     /// The last resume was a `PTRACE_SINGLESTEP`.
     stepping: bool,
     /// The instruction being single-stepped is a `pushf`; this is the
@@ -150,6 +165,12 @@ impl Task {
             mem_restore: None,
             exit_status: None,
             exit_reported: false,
+            sig_epoch_seen: 0,
+            bound_port: None,
+            port_tries: 0,
+            exec_bp: None,
+            keep_exec_bp: false,
+            watch_addrs: Vec::new(),
             stepping: false,
             pushf_target: None,
         })
@@ -214,6 +235,10 @@ impl Task {
             self.syscall_nr = nr;
         }
         let sig = std::mem::replace(&mut self.pending_sig, 0);
+        if self.exec_bp.is_some() && !self.keep_exec_bp {
+            crate::watch::disarm_exec_breakpoint(self.tid, &self.watch_addrs)?;
+            self.exec_bp = None;
+        }
         self.pushf_target = None;
         self.stepping = how == ResumeHow::SingleStep;
         if self.stepping && sig == 0 {

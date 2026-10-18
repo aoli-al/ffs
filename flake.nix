@@ -27,6 +27,7 @@
           gdb
           strace
           jdk17
+          maven
           python3
         ];
       in

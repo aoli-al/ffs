@@ -832,6 +832,13 @@ impl Session {
             watch_disabled: 0,
             file_snapshots: self.file_snapshots.clone(),
             watch_preempt: false,
+            progress: self.progress.clone(),
+            created_at: self.created_at.clone(),
+            first_output: self.first_output,
+            prearmed: std::collections::BTreeSet::new(),
+            ports_used: self.ports_used.clone(),
+            port_plan: self.port_plan.clone(),
+            next_port: self.next_port,
             cap_preempt: false,
         };
         let mut pid_map: Vec<(pid_t, pid_t)> = Vec::new();

@@ -22,6 +22,12 @@ pub struct Step {
     /// (or this is a legacy trace), not that it wrote no bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effects: Option<crate::effects::Effects>,
+    /// Virtual time (ns) just before the step.  Whether the scheduler
+    /// jumped the virtual clock while every thread was blocked depends on
+    /// real I/O timing, so a replay sets its clock from this instead of
+    /// deciding again (0 in traces that predate the field).
+    #[serde(default)]
+    pub vt: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,8 +36,26 @@ pub enum Outcome {
     Exited { code: i32 },
     /// `ffs_assert` failed in the tracee.
     AssertFailed { msg: String },
-    /// No thread could make progress.
-    Deadlock { blocked: Vec<Ltid> },
+    /// No thread could make progress: `blocked` waits without a timeout,
+    /// and for `wakes` virtual-deadline wakeups over `vtime_ns` nothing
+    /// but the timer-driven threads `timers` ran (see
+    /// `Session::deadlock_check`).
+    Deadlock {
+        blocked: Vec<Ltid>,
+        #[serde(default)]
+        timers: Vec<Ltid>,
+        #[serde(default)]
+        vtime_ns: u64,
+        #[serde(default)]
+        wakes: u64,
+    },
+    /// The program neither terminated nor deadlocked within `--max-vtime`
+    /// virtual seconds: a livelock, a hang on a timer, or a long run.
+    Hang {
+        vtime_ns: u64,
+        runnable: Vec<Ltid>,
+        blocked: Vec<Ltid>,
+    },
     /// The tracee was killed by a signal (e.g. SIGSEGV, SIGABRT).
     Killed { sig: i32 },
     /// The step bound was reached.
@@ -54,7 +78,7 @@ impl Outcome {
     pub fn is_failure(&self) -> bool {
         matches!(
             self,
-            Outcome::AssertFailed { .. } | Outcome::Deadlock { .. } | Outcome::Killed { .. }
+            Outcome::AssertFailed { .. } | Outcome::Deadlock { .. } | Outcome::Hang { .. } | Outcome::Killed { .. }
         ) || matches!(self, Outcome::Exited { code } if *code != 0)
     }
 }
@@ -84,6 +108,10 @@ pub struct Trace {
     pub env: Vec<(String, String)>,
     #[serde(default)]
     pub cwd: String,
+    /// Ports ffs chose for the program's `bind`s to port 0, in order; a
+    /// replay binds the same ones (see `Session::net_pre_syscall`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<u16>,
     pub steps: Vec<Step>,
     pub outcome: Outcome,
 }
@@ -102,6 +130,7 @@ impl Trace {
             cwd: std::env::current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            ports: Vec::new(),
             steps: Vec::new(),
             outcome: Outcome::Bound,
         }

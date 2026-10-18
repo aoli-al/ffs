@@ -216,6 +216,14 @@ fn base_attr(cfg: &PmuConfig) -> PerfEventAttr {
 /// Per-thread ticks counter.
 pub struct TicksCounter {
     fd: Option<OwnedFd>,
+    /// The event has been enabled (it then stays enabled: a thread that is
+    /// stopped or in the kernel retires no user branches, so there is
+    /// nothing to switch off, and that saves two ioctls per resume).
+    enabled: bool,
+    /// Sample period currently programmed.
+    period: u64,
+    /// Cumulative count at the last `stop`.
+    last: u64,
 }
 
 /// Effectively "no interrupt".
@@ -227,7 +235,7 @@ impl TicksCounter {
     pub fn open(cfg: &PmuConfig, tid: pid_t) -> Result<TicksCounter> {
         if cfg.source == TicksSource::None {
             let _ = tid;
-            return Ok(TicksCounter { fd: None });
+            return Ok(TicksCounter { fd: None, enabled: false, period: UNLIMITED_PERIOD, last: 0 });
         }
         let mut attr = base_attr(cfg);
         attr.sample_period = UNLIMITED_PERIOD;
@@ -251,7 +259,7 @@ impl TicksCounter {
                 bail!("F_SETSIG: {}", std::io::Error::last_os_error());
             }
         }
-        Ok(TicksCounter { fd: Some(fd) })
+        Ok(TicksCounter { fd: Some(fd), enabled: false, period: UNLIMITED_PERIOD, last: 0 })
     }
 
     /// Start counting from zero; interrupt the thread after `period` ticks
@@ -264,24 +272,34 @@ impl TicksCounter {
             period.max(1)
         };
         unsafe {
-            libc::ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_RESET, 0);
-            let p: u64 = period;
-            if libc::ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_PERIOD, &p as *const u64) < 0 {
-                bail!("PERF_EVENT_IOC_PERIOD: {}", std::io::Error::last_os_error());
+            // A finite budget counts from now: PERF_EVENT_IOC_PERIOD
+            // restarts the period (period_left) even when the value is
+            // unchanged.  An unlimited one only needs programming once.
+            if period != UNLIMITED_PERIOD || self.period != UNLIMITED_PERIOD {
+                let p: u64 = period;
+                if libc::ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_PERIOD, &p as *const u64) < 0 {
+                    bail!("PERF_EVENT_IOC_PERIOD: {}", std::io::Error::last_os_error());
+                }
             }
-            libc::ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_ENABLE, 0);
+            if !self.enabled {
+                libc::ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_ENABLE, 0);
+            }
         }
+        self.enabled = true;
+        self.period = period;
         Ok(())
     }
 
-    /// Stop counting and return the number of ticks since `start`.
+    /// Return the number of ticks since the previous `stop` (the counter
+    /// keeps running; a stopped thread does not count).
     pub fn stop(&mut self) -> Result<u64> {
-        let Some(fd) = &self.fd else { return Ok(0) };
-        let v = self.read()?;
-        unsafe {
-            libc::ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_DISABLE, 0);
+        if self.fd.is_none() {
+            return Ok(0);
         }
-        Ok(v)
+        let v = self.read()?;
+        let delta = v.wrapping_sub(self.last);
+        self.last = v;
+        Ok(delta)
     }
 
     pub fn read(&self) -> Result<u64> {

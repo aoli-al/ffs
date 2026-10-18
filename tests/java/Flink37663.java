@@ -58,6 +58,9 @@ public final class Flink37663 {
         Ffs.begin();
         queue.wakeUpPuttingThread(0);
         boolean sequenced = args.length > 0 && args[0].equals("sequenced");
+        // "notimeout": wait for B forever, so the bug is a real deadlock
+        // for ffs's detector to find rather than an assertion.
+        boolean noTimeout = args.length > 0 && args[0].equals("notimeout");
         if (sequenced) Ffs.check(aDone.await(TIMEOUT, TimeUnit.SECONDS), "producer A failed to wake");
         else Ffs.yield(); // Explore whether A returns before the consumer frees space.
         Ffs.check(queue.poll() == 0, "consumer did not remove initial element");
@@ -67,6 +70,7 @@ public final class Flink37663 {
         // cannot insert until this second poll, so this is not an extra wakeup
         // masking the bug when A instead returned false.
         if (aInserted) Ffs.check(queue.poll() == 1, "missing producer A element");
+        if (noTimeout) bDone.await();
         boolean completed = bDone.await(TIMEOUT, TimeUnit.SECONDS);
         if (!completed) System.out.println("FLINK-37663: B stranded; queued=" + queuedPutters() + ", size=" + queue.size());
         Ffs.check(completed, "FLINK-37663: producer B stranded after consumer freed a slot");

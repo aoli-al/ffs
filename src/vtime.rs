@@ -42,6 +42,10 @@ const TIMER_SETTIME: u64 = 223;
 const TIMER_GETTIME: u64 = 224;
 const TIMER_GETOVERRUN: u64 = 225;
 const TIMER_DELETE: u64 = 226;
+const TIMERFD_CREATE: u64 = 283;
+const TIMERFD_SETTIME: u64 = 286;
+const TIMERFD_GETTIME: u64 = 287;
+const CLOSE: u64 = 3;
 const FUTEX: u64 = 202;
 const FUTEX_WAITV: u64 = 449;
 const POLL: u64 = 7;
@@ -100,6 +104,11 @@ pub enum Emulation {
 pub enum TimerKind {
     Itimer(u64),
     Posix { id: i32, clockid: u64, notify: i32 },
+    /// A timerfd of the process: the kernel's timer stays disarmed, the
+    /// deadline lives on the virtual clock, and when it arrives ffs arms
+    /// the real timerfd for one immediate expiration so the descriptor
+    /// becomes readable (and wakes epoll/poll/read on it) exactly then.
+    TimerFd { fd: i32, clockid: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +122,8 @@ pub struct VTimer {
     pub deadline: Option<u64>,
     pub interval: u64,
     pub overrun: i32,
+    /// Expirations since the deadlock detector last saw progress.
+    pub fires: u32,
 }
 
 fn read_ts(t: &Task, addr: u64) -> Result<u64> {
@@ -297,9 +308,85 @@ impl Session {
                 self.strip_timeout(tid, deadline, ret, set)?;
             }
             SETITIMER | GETITIMER | ALARM | TIMER_CREATE | TIMER_SETTIME | TIMER_GETTIME
-            | TIMER_GETOVERRUN | TIMER_DELETE => {
+            | TIMER_GETOVERRUN | TIMER_DELETE | TIMERFD_GETTIME => {
                 let ret = self.vt_timer_syscall(tid, nr)?;
                 self.emulate_syscall(tid, Emulation::Ret(ret))?;
+            }
+            TIMERFD_SETTIME => self.vt_timerfd_settime(tid)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// `timerfd_settime`: take the deadline onto the virtual clock and let
+    /// the kernel see a disarming call (all-zero `new_value`, restored
+    /// after the syscall), so the real timer never fires on its own.
+    fn vt_timerfd_settime(&mut self, tid: pid_t) -> Result<()> {
+        let now = self.virtual_ns();
+        let key = self.proc_key(tid)?;
+        let t = self.task_mut(tid)?;
+        let r = t.regs()?;
+        let fd = r.rdi as i32;
+        if r.rdx == 0 || t.mem_restore.is_some() {
+            return Ok(());
+        }
+        let Some(idx) = self
+            .vtimers
+            .iter()
+            .position(|tm| tm.proc_key == key && matches!(tm.kind, TimerKind::TimerFd { fd: f, .. } if f == fd))
+        else {
+            return Ok(()); // not a timerfd we know (EINVAL/EBADF from the kernel)
+        };
+        let t = self.task_mut(tid)?;
+        let (Ok(interval), Ok(value)) = (read_ts(t, r.rdx), read_ts(t, r.rdx + 16)) else { return Ok(()) };
+        let clockid = match self.vtimers[idx].kind {
+            TimerKind::TimerFd { clockid, .. } => clockid,
+            _ => 1,
+        };
+        let deadline = if value == 0 {
+            None
+        } else if r.rsi & TIMER_ABSTIME != 0 {
+            Some(self.abs_to_virtual(clockid, value).max(now))
+        } else {
+            Some(now + value)
+        };
+        {
+            let tm = &mut self.vtimers[idx];
+            tm.interval = interval;
+            tm.deadline = deadline;
+            tm.overrun = 0;
+        }
+        let t = self.task_mut(tid)?;
+        let mut old = [0u8; 32];
+        t.mem.read(r.rdx, &mut old)?;
+        t.mem.write(r.rdx, &[0u8; 32])?;
+        t.mem_restore = Some((r.rdx, old.to_vec()));
+        Ok(())
+    }
+
+    /// Bookkeeping at the exit of syscalls that create or close timerfds.
+    pub fn vt_timerfd_exit(&mut self, tid: pid_t, nr: u64) -> Result<()> {
+        let key = self.proc_key(tid)?;
+        let r = self.task_mut(tid)?.regs()?;
+        match nr {
+            TIMERFD_CREATE if (r.rax as i64) >= 0 => {
+                let fd = r.rax as i32;
+                self.vtimers.retain(|tm| !(tm.proc_key == key && matches!(tm.kind, TimerKind::TimerFd { fd: f, .. } if f == fd)));
+                self.vtimers.push(VTimer {
+                    proc_key: key,
+                    thread: None,
+                    kind: TimerKind::TimerFd { fd, clockid: r.rdi },
+                    sig: 0,
+                    sigval: 0,
+                    deadline: None,
+                    interval: 0,
+                    overrun: 0,
+                    fires: 0,
+                });
+            }
+            CLOSE if r.rax == 0 => {
+                let fd = r.rdi as i32;
+                self.vtimers.retain(|tm| !(tm.proc_key == key && matches!(tm.kind, TimerKind::TimerFd { fd: f, .. } if f == fd)));
             }
             _ => {}
         }
@@ -315,6 +402,7 @@ impl Session {
         if let Some((addr, bytes)) = t.mem_restore.take() {
             t.mem.write(addr, &bytes)?;
         }
+        t.bound_port = None;
         if let (SELECT | PPOLL | PSELECT6, Some(e), Some(d)) = (t.syscall_nr, t.entry_regs, deadline) {
             // The raw select, pselect6 and ppoll syscalls update their
             // timeout buffers (libc may hide this with a temporary copy).
@@ -400,6 +488,7 @@ impl Session {
                         deadline: Some(now + value),
                         interval,
                         overrun: 0,
+                        fires: 0,
                     });
                 }
                 Ok(if nr == ALARM { old.0.div_ceil(NS_PER_SEC) as i64 } else { 0 })
@@ -445,6 +534,7 @@ impl Session {
                     deadline: None,
                     interval: 0,
                     overrun: 0,
+                    fires: 0,
                 });
                 let t = self.task_mut(tid)?;
                 t.mem.write(r.rdx, &id.to_ne_bytes())?;
@@ -504,6 +594,25 @@ impl Session {
                     }
                 }
             }
+            TIMERFD_GETTIME => {
+                let want = r.rdi as i32;
+                let Some(idx) = self
+                    .vtimers
+                    .iter()
+                    .position(|tm| tm.proc_key == key && matches!(tm.kind, TimerKind::TimerFd { fd, .. } if fd == want))
+                else {
+                    return Ok(-(libc::EINVAL as i64));
+                };
+                if r.rsi == 0 {
+                    return Ok(-(libc::EFAULT as i64));
+                }
+                let left = remaining(&self.vtimers[idx]);
+                let interval = self.vtimers[idx].interval;
+                let t = self.task_mut(tid)?;
+                write_ts(t, r.rsi, interval)?;
+                write_ts(t, r.rsi + 16, left)?;
+                Ok(0)
+            }
             _ => unreachable!(),
         }
     }
@@ -532,6 +641,81 @@ impl Session {
                 tm.deadline = if interval > 0 { Some(deadline + (late_periods + 1) * interval) } else { None };
                 tm.overrun = tm.overrun.saturating_add(late_periods as i32);
             }
+            if let TimerKind::TimerFd { fd, .. } = kind {
+                // Make the real descriptor expire now: a one-shot arm of
+                // one nanosecond, injected into a stopped thread of the
+                // process (it has none stopped only while all its threads
+                // are blocked in the kernel; then the next check retries).
+                let leader = self.ltids.get(&proc_key).copied();
+                let mut tid = self.tasks.values().find(|t| Some(t.tgid) == leader && t.is_ptrace_stopped()).map(|t| t.tid);
+                if leader.is_some() && tid.is_none() {
+                    // Every thread is blocked in the kernel (typically in
+                    // epoll_wait on this very descriptor): interrupt one,
+                    // rewind it to re-execute its syscall, and use it.
+                    let blocked = self
+                        .tasks
+                        .values()
+                        .find(|t| Some(t.tgid) == leader && matches!(t.state, State::Blocked { .. }) && t.vblock.is_none())
+                        .map(|t| t.tid);
+                    if let Some(b) = blocked {
+                        self.interrupt_blocked(b)?;
+                        let t = self.task_mut(b)?;
+                        if t.restarting {
+                            t.rewind_interrupted_syscall()?;
+                            t.restarting = false;
+                        } else if matches!(t.stop(), Some(Stop::SyscallExit { ret, .. }) if ret == -(libc::EINTR as i64))
+                            && ptrace::interrupting_signals(b) == 0
+                        {
+                            // epoll waits are not restartable: the interrupt
+                            // made this one return EINTR.  Re-execute it
+                            // instead of letting the program see that.
+                            let nr = t.syscall_nr;
+                            let mut r = t.regs()?;
+                            r.rip -= ptrace::SYSCALL_INSN_LEN;
+                            r.rax = nr;
+                            r.orig_rax = nr;
+                            t.set_regs(&r)?;
+                            t.in_syscall = false;
+                            t.rewound = true;
+                            t.unreported = false;
+                            t.state = State::Stopped(Stop::Parked);
+                        }
+                        if t.is_ptrace_stopped() {
+                            tid = Some(b);
+                        }
+                    }
+                }
+                match (leader, tid) {
+                    (None, _) => {
+                        self.vtimers.remove(i);
+                        continue;
+                    }
+                    (Some(_), None) => {
+                        // Undo the re-arm above; try again later.
+                        self.vtimers[i].deadline = Some(deadline);
+                        i += 1;
+                        continue;
+                    }
+                    (Some(_), Some(tid)) => {
+                        let ret = {
+                            let t = self.task_mut(tid)?;
+                            let mut remote = crate::remote::Remote::new(t)?;
+                            let mut spec = [0u8; 32];
+                            spec[24..32].copy_from_slice(&1u64.to_ne_bytes()); // it_value.tv_nsec = 1
+                            let addr = remote.push_scratch(&spec)?;
+                            let ret = remote.syscall(TIMERFD_SETTIME, &[fd as u64, 0, addr, 0])?;
+                            remote.restore()?;
+                            ret
+                        };
+                        if ret < 0 {
+                            log::debug!("timerfd {fd}: injected timerfd_settime failed: {ret}");
+                        }
+                        self.vtimers[i].fires += 1;
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
             let notify_none = matches!(kind, TimerKind::Posix { notify: SIGEV_NONE, .. });
             let Some(target) = self.signal_target(proc_key, thread, sig) else {
                 // The process is gone.
@@ -549,6 +733,7 @@ impl Session {
                         TimerKind::Itimer(_) => {
                             info[8..12].copy_from_slice(&SI_KERNEL.to_ne_bytes());
                         }
+                        TimerKind::TimerFd { .. } => unreachable!("handled above"),
                         TimerKind::Posix { id, .. } => {
                             info[8..12].copy_from_slice(&SI_TIMER.to_ne_bytes());
                             info[16..20].copy_from_slice(&id.to_ne_bytes());
@@ -561,6 +746,7 @@ impl Session {
                     ptrace::tgkill(tgid, target, sig)?;
                     let ltid = self.task(target)?.ltid;
                     self.siginfo_queue.push((ltid, sig, info));
+                    self.vtimers[i].fires += 1;
                 }
             }
             i += 1;
@@ -618,6 +804,12 @@ impl Session {
     /// End a virtual block with result `ret`.
     pub fn vt_wake(&mut self, tid: pid_t, ret: i64) -> Result<()> {
         let now = self.virtual_ns();
+        let ltid = self.task(tid)?.ltid;
+        if ret == 0 {
+            self.note_timer_wake(ltid);
+        } else {
+            self.note_progress(); // a signal from someone
+        }
         let t = self.task_mut(tid)?;
         let Some(vb) = t.vblock.take() else { return Ok(()) };
         if ret == -(libc::EINTR as i64) && vb.rem != 0 {
@@ -637,6 +829,8 @@ impl Session {
     /// timeout result.
     fn vt_timeout(&mut self, tid: pid_t) -> Result<()> {
         let Some((_, ret)) = self.task(tid)?.vdeadline else { return Ok(()) };
+        let ltid = self.task(tid)?.ltid;
+        self.note_timer_wake(ltid);
         self.interrupt_blocked(tid)?;
         let t = self.task_mut(tid)?;
         // epoll waits are not restartable: PTRACE_INTERRUPT makes them
@@ -672,9 +866,14 @@ impl Session {
                 return self.vt_wake(tid, 0);
             }
             // Only a signal the program would actually be interrupted by
-            // (not ignored, not the tracer's own preemption signal).
-            if ptrace::interrupting_signals(tid) != 0 {
-                return self.vt_wake(tid, -(libc::EINTR as i64));
+            // (not ignored, not the tracer's own preemption signal); the
+            // pending set (/proc) is re-read only after a signal was sent.
+            let epoch = ptrace::sig_epoch();
+            if t.sig_epoch_seen != epoch {
+                self.task_mut(tid)?.sig_epoch_seen = epoch;
+                if ptrace::interrupting_signals(tid) != 0 {
+                    return self.vt_wake(tid, -(libc::EINTR as i64));
+                }
             }
         } else if matches!(t.state, State::Blocked { .. }) {
             if let Some((d, _)) = t.vdeadline {

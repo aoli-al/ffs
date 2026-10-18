@@ -29,6 +29,12 @@ pub enum Decision {
     },
     /// Resume `ltid` into its syscall and consider it blocked.
     ResumeBlocked { ltid: Ltid },
+    /// Replay: run `ltid` through its syscall with ffs's preemption signal
+    /// pending, as it was in the recording (the trace shows the preemption
+    /// right after the syscall exit, at the same ticks and instruction).
+    /// The kernel cuts some results short when a signal is pending:
+    /// `getdents64` returns one entry, a pipe write stops between chunks.
+    RunPending { ltid: Ltid },
     /// Normalize all threads as a checkpoint would (replay of a `Fork` step).
     Fork,
     /// Stop the run with this outcome.
@@ -45,10 +51,84 @@ pub struct SchedContext<'a> {
     /// The last event was a preemption caused by a watchpoint (an access
     /// to a shared variable), not by the expiry of a tick budget.
     pub watch_preempt: bool,
+    /// Spin level of `current` (see `SpinTracker`): 0 unless its last few
+    /// slices all ended by tick budget in the same code page.
+    pub spin_level: u32,
+}
+
+/// Busy-wait detection.  Under a serializing scheduler a thread that spins
+/// on a condition another thread must produce (`while (!done) {}`, a
+/// polling loop) runs its whole slice every time it is scheduled, where
+/// natively the other thread would have satisfied it in microseconds on
+/// another core.  That inflates virtual time (a 1M-tick slice is a
+/// millisecond), wall time, and under PCT it starves every lower-priority
+/// thread forever.  A thread whose consecutive slices all end by tick
+/// budget with the instruction pointer in the same 4 KiB page is taken to
+/// be spinning: its slices shrink by 4x per level (down to
+/// `SPIN_MIN_SLICE`), and PCT/FIFO treat its preemptions as yields.  A
+/// long computation moves through many pages and is left alone; a hot
+/// numeric loop looks like a spinner and just gets more scheduling points.
+#[derive(Default)]
+pub struct SpinTracker {
+    /// Per thread: page of the last preemption, consecutive same-page
+    /// preemptions.
+    per: std::collections::BTreeMap<Ltid, (u64, u32)>,
+}
+
+/// Same-page preemptions before a thread counts as spinning.
+const SPIN_STREAK: u32 = 2;
+/// Smallest slice a spinner is given (ticks).
+pub const SPIN_MIN_SLICE: u64 = 16 * 1024;
+
+impl SpinTracker {
+    pub fn observe(&mut self, step: &Step, watch_preempt: bool) {
+        match step.event {
+            Event::Preempt | Event::Slice if !watch_preempt => {
+                let page = step.rip >> 12;
+                let e = self.per.entry(step.ltid).or_insert((page, 0));
+                // A loop body straddling a page boundary alternates
+                // between two neighbouring pages.
+                if e.0.abs_diff(page) <= 1 {
+                    e.1 += 1;
+                } else {
+                    *e = (page, 1);
+                }
+            }
+            Event::Fork | Event::SyscallEntry { .. } => {}
+            _ => {
+                // A polling loop still makes the odd syscall (a contended
+                // lock inside it, a yield): that only weakens the evidence,
+                // real work moves to other pages and resets it above.
+                if let Some(e) = self.per.get_mut(&step.ltid) {
+                    e.1 = e.1.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    /// 0: not spinning; n: spinning, n levels deep.
+    pub fn level(&self, ltid: Ltid) -> u32 {
+        self.per.get(&ltid).map(|e| e.1.saturating_sub(SPIN_STREAK)).unwrap_or(0)
+    }
+
+    /// The budget a spinning thread gets instead of `budget` (which must
+    /// be nonzero: an unbounded run is left alone, as is a replay).
+    pub fn cap(&self, ltid: Ltid, budget: u64) -> u64 {
+        let level = self.level(ltid);
+        if budget == 0 || level == 0 {
+            return budget;
+        }
+        let cap = (budget >> (2 * level.min(10))).max(SPIN_MIN_SLICE);
+        budget.min(cap)
+    }
 }
 
 pub trait Policy {
     fn decide(&mut self, ctx: &SchedContext) -> Result<Decision>;
+    /// Replay: the virtual time the next step was recorded at, if known.
+    fn expected_vt(&self) -> Option<u64> {
+        None
+    }
     /// Called after each step; returns Err to abort the run (e.g. divergence).
     fn observe(&mut self, _step: &Step) -> Result<Option<Outcome>> {
         Ok(None)
@@ -79,6 +159,7 @@ impl Policy for Fifo {
     fn decide(&mut self, ctx: &SchedContext) -> Result<Decision> {
         let rotate = matches!(ctx.last_event, Some(Event::Preempt | Event::Slice))
             || is_yield(ctx.last_event)
+            || ctx.spin_level > 0
             || self.run >= FIFO_MAX_RUN;
         let ltid = match ctx.current {
             Some(c) if ctx.enabled.contains(&c) && !rotate => c,
@@ -91,9 +172,18 @@ impl Policy for Fifo {
             _ => ctx.enabled[0],
         };
         self.run = if Some(ltid) == ctx.current { self.run + 1 } else { 0 };
-        let budget = if ctx.enabled.len() > 1 { self.max_slice } else { 0 };
+        let budget = if others_may_run(ctx) { self.max_slice } else { 0 };
         Ok(Decision::Run { ltid, budget, steps: 0 })
     }
+}
+
+/// Should a slice be bounded?  Yes while any other thread exists that could
+/// run: one that is enabled, or one blocked in the kernel, whose wakeup
+/// (the lock the running thread just released, data it just wrote) may be
+/// in flight and must not wait behind an unbounded run of a busy-waiting
+/// thread until the real-time cap.
+pub fn others_may_run(ctx: &SchedContext) -> bool {
+    ctx.enabled.len() > 1 || !ctx.blocked.is_empty()
 }
 
 /// The last event was a `sched_yield` or `ffs_yield`: the thread asked to
@@ -120,11 +210,7 @@ impl Policy for RoundRobin {
                 .unwrap_or(ctx.enabled[0]),
             None => ctx.enabled[0],
         };
-        let budget = if ctx.enabled.len() > 1 {
-            self.max_slice
-        } else {
-            0
-        };
+        let budget = if others_may_run(ctx) { self.max_slice } else { 0 };
         Ok(Decision::Run { ltid, budget, steps: 0 })
     }
 }
@@ -199,7 +285,7 @@ impl Policy for Random {
             0
         };
         let steps = if budget > 0 && self.max_steps > 0 { self.rng.gen_range(0..=self.max_steps) } else { 0 };
-        if self.max_slice > 0 && ctx.enabled.len() > 1 && (budget == 0 || budget > self.max_slice) {
+        if self.max_slice > 0 && others_may_run(ctx) && (budget == 0 || budget > self.max_slice) {
             budget = self.max_slice;
         }
         Ok(Decision::Run { ltid, budget, steps })
@@ -261,7 +347,7 @@ impl Policy for Pct {
         if let Some(c) = ctx.current {
             // A change point, or a yield: strict priorities would otherwise
             // let a thread spinning on `sched_yield` starve everyone else.
-            if self.change_points.contains(&self.step) || is_yield(ctx.last_event) {
+            if self.change_points.contains(&self.step) || is_yield(ctx.last_event) || ctx.spin_level > 0 {
                 self.lowest -= 1;
                 self.priorities.insert(c, self.lowest);
             }
@@ -278,7 +364,7 @@ impl Policy for Pct {
             0
         };
         let steps = if budget > 0 && self.max_steps > 0 { self.rng.gen_range(0..=self.max_steps) } else { 0 };
-        if self.max_slice > 0 && ctx.enabled.len() > 1 && (budget == 0 || budget > self.max_slice) {
+        if self.max_slice > 0 && others_may_run(ctx) && (budget == 0 || budget > self.max_slice) {
             budget = self.max_slice;
         }
         let _ = self.depth;
@@ -294,12 +380,27 @@ pub fn log_uniform(rng: &mut ChaCha8Rng, max: u64) -> u64 {
     (2f64.powf(e) as u64).clamp(1, max)
 }
 
+/// Syscalls whose result the kernel cuts short when a signal is pending
+/// (filldir stops after one entry; pipe writes, sendfile and the splice
+/// family stop between chunks).  Only these are re-executed with the
+/// recorded pending preemption signal (`Decision::RunPending`): for a wait
+/// such as `poll` the signal would instead make it return EINTR when its
+/// descriptor is not ready yet in the replay, and the recorded preemption
+/// at the exit address is reached without any signal anyway.
+fn signal_shortens(nr: u64) -> bool {
+    matches!(nr, 1 | 18 | 20 | 40 | 78 | 217 | 275 | 276 | 278 | 296 | 326)
+}
+
 /// Follow a recorded trace, verifying every event.
 pub struct Replay {
     pub steps: Vec<Step>,
     pub idx: usize,
     pub strict_ret: bool,
     pub verify_outputs: bool,
+    /// With `verify_outputs`: also compare metadata buffers (stat family,
+    /// statfs, sysinfo, uname), which carry incidental live state such as
+    /// inode numbers and timestamps.
+    pub verify_metadata: bool,
 }
 
 impl Replay {
@@ -309,6 +410,7 @@ impl Replay {
             idx: 0,
             strict_ret: true,
             verify_outputs: false,
+            verify_metadata: true,
         }
     }
 
@@ -323,6 +425,10 @@ impl Replay {
 }
 
 impl Policy for Replay {
+    fn expected_vt(&self) -> Option<u64> {
+        self.steps.get(self.idx).map(|s| s.vt).filter(|v| *v > 0)
+    }
+
     fn decide(&mut self, ctx: &SchedContext) -> Result<Decision> {
         let Some(step) = self.steps.get(self.idx) else {
             return Ok(Decision::Stop(Outcome::Bound));
@@ -401,6 +507,16 @@ impl Policy for Replay {
                 signal: Some((*sig, info.clone())),
                 slice: false,
             },
+            Event::SyscallExit { nr, .. }
+                if signal_shortens(*nr) && self.steps.get(self.idx + 1).is_some_and(|next| {
+                    next.event == Event::Preempt
+                        && next.ltid == step.ltid
+                        && next.ticks == step.ticks
+                        && next.rip == step.rip
+                }) =>
+            {
+                Decision::RunPending { ltid: step.ltid }
+            }
             _ => Decision::Run {
                 ltid: step.ltid,
                 budget: 0,
@@ -432,7 +548,9 @@ impl Policy for Replay {
             }
             (a, b) => a == b,
         };
+        let metadata = matches!(step.event, Event::SyscallExit { nr, .. } if crate::effects::metadata_query(nr));
         let effects_match = !self.verify_outputs
+            || (metadata && !self.verify_metadata)
             || expected.effects.as_ref().is_none_or(|e| step.effects.as_ref() == Some(e));
         if !same || expected.ltid != step.ltid || !effects_match {
             return Ok(Some(Outcome::Divergence {
@@ -483,7 +601,7 @@ pub type StepHook<'a> = &'a mut dyn FnMut(&mut Session, &Step) -> Result<Option<
 
 /// Settle the session and check for termination.  Returns an outcome if
 /// the execution is over (all exited / deadlock), otherwise the enabled set.
-pub fn observe(session: &mut Session) -> Result<std::result::Result<Vec<Ltid>, Outcome>> {
+pub fn observe(session: &mut Session, expected_vt: Option<u64>) -> Result<std::result::Result<Vec<Ltid>, Outcome>> {
     session.settle()?;
     if session.all_exited() {
         let code = session.main_exit_code().unwrap_or(0);
@@ -502,15 +620,41 @@ pub fn observe(session: &mut Session) -> Result<std::result::Result<Vec<Ltid>, O
             c => Outcome::Exited { code: c },
         }));
     }
+    if let Some((vtime_ns, runnable, blocked)) = session.hang_check() {
+        return Ok(Err(Outcome::Hang { vtime_ns, runnable, blocked }));
+    }
     let mut enabled = session.enabled();
     if enabled.is_empty() {
-        if !session.wait_for_any_enabled()? {
+        if let Some(d) = session.deadlock_check() {
+            return Ok(Err(Outcome::Deadlock {
+                blocked: d.blocked,
+                timers: d.timers,
+                vtime_ns: d.vtime_ns,
+                wakes: d.wakes,
+            }));
+        }
+        if session.replay && expected_vt.is_some_and(|vt| vt > session.virtual_ns()) {
+            // The trace advances the clock before its next step (the
+            // recording jumped to a deadline here): nothing to wait for.
+            return Ok(Ok(enabled));
+        }
+        let progressed = if session.replay {
+            // A replay never jumps the clock on its own (the trace says
+            // when); it waits for the real completion the trace promises.
+            session.wait_for_completion()?
+        } else {
+            session.wait_for_any_enabled()?
+        };
+        if !progressed {
             return Ok(Err(Outcome::Deadlock {
                 blocked: session.blocked(),
+                timers: Vec::new(),
+                vtime_ns: 0,
+                wakes: 0,
             }));
         }
         if session.all_exited() {
-            return observe(session);
+            return observe(session, expected_vt);
         }
         enabled = session.enabled();
     }
@@ -537,6 +681,10 @@ pub fn perform(session: &mut Session, decision: &Decision) -> Result<Step> {
             (*ltid, ev)
         }
         Decision::ResumeBlocked { ltid } => (*ltid, session.resume_as_blocked(*ltid)?),
+        Decision::RunPending { ltid } => {
+            session.prearm_preempt(*ltid)?;
+            (*ltid, session.run_task(*ltid, 0)?)
+        }
         Decision::Fork => {
             session.normalize_all()?;
             return Ok(Step {
@@ -545,6 +693,7 @@ pub fn perform(session: &mut Session, decision: &Decision) -> Result<Step> {
                 ticks: 0,
                 rip: 0,
                 effects: None,
+                vt: 0,
             });
         }
         Decision::Stop(_) => unreachable!(),
@@ -556,6 +705,7 @@ pub fn perform(session: &mut Session, decision: &Decision) -> Result<Step> {
     };
     let effects = crate::effects::capture(session, ltid, &event)?;
     Ok(Step {
+        vt: 0,
         ltid,
         event,
         ticks,
@@ -585,6 +735,7 @@ pub fn drive(
     let mut current: Option<Ltid> = None;
     let mut last_event: Option<Event> = None;
     let mut steps = 0usize;
+    let mut spin = SpinTracker::default();
     let finish = |trace: &mut Trace, outcome: Outcome| {
         trace.outcome = outcome.clone();
         Ok(outcome)
@@ -593,33 +744,64 @@ pub fn drive(
         if crate::session::TERMINATED.load(std::sync::atomic::Ordering::SeqCst) {
             return finish(trace, Outcome::Error { msg: "terminated by SIGTERM".into() });
         }
-        let enabled = match observe(session)? {
+        let expected_vt = policy.expected_vt();
+        let mut enabled = match observe(session, expected_vt)? {
             Ok(e) => e,
             Err(outcome) => return finish(trace, outcome),
         };
         if steps >= opts.max_steps {
             return finish(trace, Outcome::Bound);
         }
+        if let Some(vt) = expected_vt {
+            // Replay: put the virtual clock where the recording had it.
+            let now = session.virtual_ns();
+            if vt > now {
+                session.vclock.skew += vt - now;
+                // Deadlines reached by the jump wake their threads.
+                session.vt_check()?;
+                enabled = session.enabled();
+            } else if vt < now {
+                log::debug!("replay clock ahead of the trace at step {}: {} > {}", trace.steps.len(), now, vt);
+            }
+        }
+        let vt_before = session.virtual_ns();
         let blocked = session.blocked();
-        let decision = policy.decide(&SchedContext {
+        if opts.verbose {
+            eprintln!("[ffs]       enabled={enabled:?} blocked={blocked:?} vt={}", session.virtual_ns());
+        }
+        let mut decision = policy.decide(&SchedContext {
             current,
             last_event: last_event.as_ref(),
             enabled: &enabled,
             blocked: &blocked,
             step: trace.steps.len(),
             watch_preempt: session.watch_preempt,
+            spin_level: current.map(|c| spin.level(c)).unwrap_or(0),
         })?;
         if let Decision::Stop(outcome) = decision {
             return finish(trace, outcome);
         }
-        let step = perform(session, &decision)?;
+        if let Decision::Run { ltid, budget, steps: insn } = &mut decision {
+            // A spinner alone (the others blocked, perhaps with a wakeup in
+            // flight) keeps the ordinary bounded slice: shrinking it would
+            // only multiply the steps spent waiting for them.
+            let capped = if enabled.len() > 1 { spin.cap(*ltid, *budget) } else { *budget };
+            if capped != *budget {
+                *budget = capped;
+                *insn = 0;
+            }
+        }
+        let mut step = perform(session, &decision)?;
+        step.vt = vt_before;
+        spin.observe(&step, session.watch_preempt);
         if opts.verbose {
             eprintln!(
-                "[ffs] {:5} T{} ticks={} rip={:#x} {}",
+                "[ffs] {:5} T{} ticks={} rip={:#x} vt={} {}",
                 trace.steps.len(),
                 step.ltid,
                 step.ticks,
                 step.rip,
+                session.virtual_ns(),
                 describe(&step.event)
             );
         }

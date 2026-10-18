@@ -26,6 +26,7 @@ mod vdso;
 mod vtime;
 mod watch;
 
+use task::Ltid;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -58,9 +59,28 @@ struct CommonOpts {
     /// Accepted for compatibility: virtual time is the default.
     #[arg(long, hide = true)]
     virtual_time: bool,
-    /// Seconds to wait for a blocked thread before reporting a deadlock.
+    /// Seconds of real time to wait for a thread blocked in the kernel
+    /// before reporting a deadlock (no virtual deadline pending).
     #[arg(long, default_value_t = 3.0)]
     deadlock_timeout: f64,
+    /// Deadlock detector for programs with timer threads (a JVM is never
+    /// "all blocked"): report a deadlock when some thread waits with no
+    /// timeout and this many consecutive wakeups were caused by virtual
+    /// deadlines alone (nothing was woken by another thread, no thread
+    /// started or exited), over at least --deadlock-vtime virtual seconds.
+    /// 0 disables it.
+    #[arg(long, default_value_t = 200)]
+    deadlock_wakes: u64,
+    /// Minimum virtual seconds without progress for --deadlock-wakes.
+    #[arg(long, default_value_t = 30.0)]
+    deadlock_vtime: f64,
+    /// Virtual seconds after which a run that has neither ended nor
+    /// deadlocked is reported as a hang (livelock, or waiting on a timer
+    /// forever).  0 = unlimited.  Virtual time advances about 1 ns per
+    /// conditional branch plus the time slept, so compute-bound programs
+    /// are not affected in practice.
+    #[arg(long, default_value_t = 300.0)]
+    max_vtime: f64,
     /// Microseconds a thread may sleep inside a syscall before it counts as
     /// blocked (the scheduler then switches away).
     #[arg(long, default_value_t = 100)]
@@ -128,8 +148,11 @@ struct PolicyOpts {
     /// Probability of switching threads at an event.
     #[arg(long, default_value_t = 0.5)]
     switch_prob: f64,
-    /// Maximum ticks a thread may run while others are runnable (0 = unlimited).
-    #[arg(long, default_value_t = 1_000_000)]
+    /// Maximum ticks a thread may run while others are runnable (0 =
+    /// unlimited).  100k ticks cost about as much as the scheduling step
+    /// itself, and bound what a busy-waiting thread burns per slice (a
+    /// tick is a virtual nanosecond).
+    #[arg(long, default_value_t = 100_000)]
     max_slice: u64,
 }
 
@@ -149,6 +172,11 @@ enum Cmd {
         /// Stop (and report success) when the tracee calls ffs_end().
         #[arg(long)]
         stop_at_end: bool,
+        /// Print when each thread was created and when the program first
+        /// wrote to stdout/stderr, in virtual seconds: a basis for picking
+        /// `explore --root vtime:SECS`.
+        #[arg(long)]
+        timeline: bool,
         /// Command to run.
         #[arg(required = true, last = true)]
         argv: Vec<String>,
@@ -168,6 +196,12 @@ enum Cmd {
         /// Also compare captured syscall output buffers (coverage is partial).
         #[arg(long)]
         verify_outputs: bool,
+        /// Like --verify-outputs, but ignore metadata buffers (stat family,
+        /// statfs, sysinfo, uname): inode numbers and timestamps are live
+        /// state, data read from files and directories is what makes a
+        /// program's control flow diverge.
+        #[arg(long)]
+        verify_data: bool,
         /// Command to run (defaults to the one in the trace).
         #[arg(last = true)]
         argv: Vec<String>,
@@ -216,6 +250,9 @@ fn session_opts(c: &CommonOpts, seed: u64) -> SessionOpts {
         block_grace: Duration::from_micros(c.block_grace_us),
         seed,
         deadlock_timeout: Duration::from_secs_f64(c.deadlock_timeout),
+        deadlock_wakes: c.deadlock_wakes,
+        deadlock_vtime: Duration::from_secs_f64(c.deadlock_vtime),
+        max_vtime: Duration::from_secs_f64(c.max_vtime),
         env: None,
         cwd: None,
         slice_cap: Duration::from_millis(c.slice_cap_ms),
@@ -249,9 +286,30 @@ fn report(outcome: &Outcome) -> i32 {
             eprintln!("[ffs] ASSERTION FAILED: {msg}");
             2
         }
-        Outcome::Deadlock { blocked } => {
-            eprintln!("[ffs] DEADLOCK: no thread can make progress (blocked: {blocked:?})");
+        Outcome::Deadlock { blocked, timers, vtime_ns, wakes } => {
+            let names = |v: &[Ltid]| v.iter().map(|l| format!("T{l}")).collect::<Vec<_>>().join(" ");
+            if *wakes == 0 {
+                eprintln!("[ffs] DEADLOCK: no thread can make progress (blocked: {})", names(blocked));
+            } else {
+                eprintln!(
+                    "[ffs] DEADLOCK: {} blocked with no timeout; for {:.1} virtual seconds ({wakes} wakeups) only the timer-driven threads {} ran",
+                    names(blocked),
+                    *vtime_ns as f64 / 1e9,
+                    names(timers)
+                );
+            }
             3
+        }
+        Outcome::Hang { vtime_ns, runnable, blocked } => {
+            let names = |v: &[Ltid]| v.iter().map(|l| format!("T{l}")).collect::<Vec<_>>().join(" ");
+            eprintln!(
+                "[ffs] HANG: not finished after {:.1} virtual seconds (--max-vtime); runnable: {}; blocked: {}{}",
+                *vtime_ns as f64 / 1e9,
+                names(runnable),
+                names(blocked),
+                if runnable.is_empty() { "" } else { " (a livelock?)" }
+            );
+            7
         }
         Outcome::Killed { sig } => {
             eprintln!("[ffs] program killed by signal {sig}");
@@ -322,8 +380,10 @@ fn real_main(cli: Cli) -> Result<i32> {
             policy,
             output,
             stop_at_end,
+            timeline,
             argv,
         } => {
+            let started = std::time::Instant::now();
             let pmu = pmu_for(&common.ticks)?;
             if pmu.source == TicksSource::None && policy.max_budget > 0 {
                 log::warn!("no ticks source: tick-based preemption disabled");
@@ -352,7 +412,25 @@ fn real_main(cli: Cli) -> Result<i32> {
                 &run_opts(&common, stop_at_end),
                 None,
             )?;
+            trace.ports = session.ports_used.clone();
             trace.save(&output)?;
+            eprintln!(
+                "[ffs] virtual time {:.3} s (wall {:.1} s), {} threads",
+                session.virtual_ns() as f64 / 1e9,
+                started.elapsed().as_secs_f64(),
+                session.next_ltid - 1
+            );
+            if timeline {
+                let mut line = String::from("[ffs] timeline (virtual s): T1 at 0.000");
+                for (ltid, ns) in &session.created_at {
+                    line.push_str(&format!(", T{ltid} at {:.3}", *ns as f64 / 1e9));
+                }
+                eprintln!("{line}");
+                match session.first_output {
+                    Some(ns) => eprintln!("[ffs] first write to stdout/stderr at {:.3} s", ns as f64 / 1e9),
+                    None => eprintln!("[ffs] no write to stdout/stderr"),
+                }
+            }
             eprintln!(
                 "[ffs] recorded {} steps to {}",
                 trace.steps.len(),
@@ -366,6 +444,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             strict: _,
             lenient,
             verify_outputs,
+            verify_data,
             argv,
         } => {
             let recorded = Trace::load(&trace)?;
@@ -391,9 +470,11 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
             let mut session = Session::spawn(&argv, pmu.clone(), opts)?;
             session.replay = true;
+            session.port_plan = Some(recorded.ports.clone());
             let mut pol = sched::Replay::new(&recorded);
             pol.strict_ret = !lenient;
-            pol.verify_outputs = verify_outputs;
+            pol.verify_outputs = verify_outputs || verify_data;
+            pol.verify_metadata = !verify_data;
             let mut out = Trace::new(
                 argv,
                 pmu.name.to_string(),

@@ -102,10 +102,20 @@ fn run_branch(
         if crate::session::TERMINATED.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(Outcome::Error { msg: "terminated by SIGTERM".into() });
         }
-        let enabled = match observe(session)? {
+        let expected_vt = policy.expected_vt();
+        let mut enabled = match observe(session, expected_vt)? {
             Ok(e) => e,
             Err(o) => return Ok(o),
         };
+        if let Some(vt) = expected_vt {
+            let now = session.virtual_ns();
+            if vt > now {
+                session.vclock.skew += vt - now;
+                session.vt_check()?;
+                enabled = session.enabled();
+            }
+        }
+        let vt_before = session.virtual_ns();
         if n >= max_depth {
             return Ok(Outcome::Bound);
         }
@@ -118,11 +128,13 @@ fn run_branch(
             blocked: &blocked,
             step: steps.len(),
             watch_preempt: session.watch_preempt,
+            spin_level: 0,
         })?;
         if let Decision::Stop(o) = decision {
             return Ok(o);
         }
-        let step = perform(session, &decision)?;
+        let mut step = perform(session, &decision)?;
+        step.vt = vt_before;
         if ropts.verbose {
             eprintln!(
                 "[ffs]   T{} ticks={} rip={:#x} {}",
@@ -172,11 +184,12 @@ struct Explorer {
 }
 
 impl Explorer {
-    fn save_failure(&mut self, steps: &[Step], outcome: &Outcome) -> Result<PathBuf> {
+    fn save_failure(&mut self, steps: &[Step], outcome: &Outcome, ports: &[u16]) -> Result<PathBuf> {
         std::fs::create_dir_all(&self.eopts.output_dir)?;
         let mut t = self.prefix.clone();
         t.steps.extend_from_slice(steps);
         t.outcome = outcome.clone();
+        t.ports = ports.to_vec();
         self.failures += 1;
         let path = self
             .eopts
@@ -187,11 +200,12 @@ impl Explorer {
     }
 
     /// Re-execute a branch from the root checkpoint and check the outcome.
-    fn verify(&mut self, steps: &[Step], expected: &Outcome) -> Result<bool> {
+    fn verify(&mut self, steps: &[Step], expected: &Outcome, ports: &[u16]) -> Result<bool> {
         let mut session = self
             .root
             .fork_session(true)
             .context("fork root for verification")?;
+        session.port_plan = Some(ports.to_vec());
         let t = Trace {
             version: 2,
             argv: self.argv.clone(),
@@ -202,6 +216,7 @@ impl Explorer {
             execution: self.prefix.execution.clone(),
             env: self.prefix.env.clone(),
             cwd: self.prefix.cwd.clone(),
+            ports: ports.to_vec(),
             steps: steps.to_vec(),
             outcome: expected.clone(),
         };
@@ -223,12 +238,12 @@ impl Explorer {
         Ok(ok)
     }
 
-    fn report_branch(&mut self, steps: &[Step], outcome: &Outcome) -> Result<bool> {
+    fn report_branch(&mut self, steps: &[Step], outcome: &Outcome, ports: &[u16]) -> Result<bool> {
         self.branches += 1;
         if !outcome.is_failure() {
             return Ok(false);
         }
-        let path = self.save_failure(steps, outcome)?;
+        let path = self.save_failure(steps, outcome, ports)?;
         eprintln!(
             "[ffs] branch {}: FAILURE {} after {} steps; schedule saved to {}",
             self.branches,
@@ -237,7 +252,7 @@ impl Explorer {
             path.display()
         );
         if !self.eopts.no_verify {
-            let ok = self.verify(steps, outcome)?;
+            let ok = self.verify(steps, outcome, ports)?;
             eprintln!(
                 "[ffs]   re-execution from the checkpoint: {}",
                 if ok { "reproduced" } else { "NOT reproduced" }
@@ -305,6 +320,7 @@ impl Explorer {
                 self.eopts.max_depth,
                 &mut steps,
             )?;
+            let ports = session.ports_used.clone();
             session.kill_all();
             session.restore_files();
             drop(session);
@@ -318,7 +334,7 @@ impl Explorer {
                     start.elapsed().as_secs_f64()
                 );
             }
-            if self.report_branch(&steps, &outcome)? && !self.eopts.keep_going {
+            if self.report_branch(&steps, &outcome, &ports)? && !self.eopts.keep_going {
                 return Ok(());
             }
         }
@@ -343,7 +359,7 @@ impl Explorer {
         live.files_branch_start();
         let mut stack: Vec<Node> = Vec::new();
         // Root node.
-        let enabled = match observe(&mut live)? {
+        let enabled = match observe(&mut live, None)? {
             Ok(e) => e,
             Err(o) => {
                 eprintln!("[ffs] program terminates at the root: {}", summarize(&o));
@@ -386,6 +402,7 @@ impl Explorer {
                         ticks: 0,
                         rip: 0,
                         effects: None,
+                        vt: 0,
                     });
                 }
                 let mut budget =
@@ -446,7 +463,7 @@ impl Explorer {
                     });
                     break o;
                 }
-                let enabled = match observe(&mut live)? {
+                let enabled = match observe(&mut live, None)? {
                     Ok(e) => e,
                     Err(o) => {
                         stack.push(Node {
@@ -489,7 +506,7 @@ impl Explorer {
                 );
             }
             live.kill_all();
-            if self.report_branch(&steps, &outcome)? && !self.eopts.keep_going {
+            if self.report_branch(&steps, &outcome, &live.ports_used.clone())? && !self.eopts.keep_going {
                 return Ok(());
             }
             if iterations >= self.eopts.iterations {
@@ -546,6 +563,7 @@ impl Explorer {
                     execution: self.prefix.execution.clone(),
                     env: self.prefix.env.clone(),
                     cwd: self.prefix.cwd.clone(),
+                    ports: self.prefix.ports.clone(),
                     steps: replay_steps.clone(),
                     outcome: Outcome::Bound,
                 };
@@ -559,7 +577,7 @@ impl Explorer {
                 }
             }
             // Make sure the restored node's enabled set still matches.
-            match observe(&mut live)? {
+            match observe(&mut live, None)? {
                 Ok(e) => {
                     if e != stack[target].choices {
                         log::warn!(
@@ -586,7 +604,11 @@ fn summarize(o: &Outcome) -> String {
     match o {
         Outcome::Exited { code } => format!("exited({code})"),
         Outcome::AssertFailed { msg } => format!("assertion failed: {msg}"),
-        Outcome::Deadlock { blocked } => format!("deadlock (blocked threads {blocked:?})"),
+        Outcome::Deadlock { blocked, .. } => format!("deadlock (blocked threads {blocked:?})"),
+        Outcome::Hang { vtime_ns, runnable, .. } => format!(
+            "hang ({:.1} virtual seconds without terminating; runnable threads {runnable:?})",
+            *vtime_ns as f64 / 1e9
+        ),
         Outcome::Killed { sig } => format!("killed by signal {sig}"),
         Outcome::Bound => "depth bound".to_string(),
         Outcome::End => "ffs_end".to_string(),
@@ -597,6 +619,36 @@ fn summarize(o: &Outcome) -> String {
         } => format!("divergence at {at}: expected {expected}, got {actual}"),
         Outcome::Error { msg } => format!("error: {msg}"),
         Outcome::Paused => "paused".to_string(),
+    }
+}
+
+/// A root given as a point in the run rather than an API call:
+/// `vtime:SECS` (virtual seconds, deterministic), `steps:N` (scheduling
+/// steps), `real:SECS` (wall-clock seconds since the start; where the
+/// root lands then depends on machine speed, the recorded prefix still
+/// replays).
+#[derive(Clone, Copy, Debug)]
+enum RootAfter {
+    VirtualNs(u64),
+    Steps(usize),
+    Real(std::time::Duration),
+}
+
+impl RootAfter {
+    fn parse(root: &str) -> Result<Option<RootAfter>> {
+        let secs = |v: &str| -> Result<f64> {
+            v.parse::<f64>().map_err(|_| anyhow::anyhow!("bad --root value {root:?}: expected seconds"))
+        };
+        Ok(match root.split_once(':') {
+            Some(("vtime", v)) => Some(RootAfter::VirtualNs((secs(v)? * 1e9) as u64)),
+            Some(("real", v)) => Some(RootAfter::Real(std::time::Duration::from_secs_f64(secs(v)?))),
+            Some(("steps", v)) => Some(RootAfter::Steps(
+                v.parse().map_err(|_| anyhow::anyhow!("bad --root value {root:?}: expected a step count"))?,
+            )),
+            Some(_) => anyhow::bail!("unknown --root {root:?}: start, begin, checkpoint, auto, vtime:SECS, steps:N or real:SECS"),
+            None if matches!(root, "start" | "begin" | "checkpoint" | "auto") => None,
+            None => anyhow::bail!("unknown --root {root:?}: start, begin, checkpoint, auto, vtime:SECS, steps:N or real:SECS"),
+        })
     }
 }
 
@@ -622,12 +674,21 @@ pub fn explore(
     // Phase 1: run to the root with a deterministic policy.
     if root_kind != "start" {
         let mut fifo = sched::Fifo::new(DRAIN_SLICE);
-        let mut hook = |_s: &mut Session, step: &Step| -> Result<Option<Outcome>> {
-            let hit = matches!(
-                (&step.event, root_kind.as_str()),
-                (Event::Checkpoint { .. }, "auto" | "checkpoint")
-                    | (Event::Begin, "auto" | "begin")
-            );
+        let after = RootAfter::parse(&root_kind)?;
+        let started = std::time::Instant::now();
+        let mut steps = 0usize;
+        let mut hook = |s: &mut Session, step: &Step| -> Result<Option<Outcome>> {
+            steps += 1;
+            let hit = match after {
+                Some(RootAfter::VirtualNs(ns)) => s.virtual_ns() >= ns,
+                Some(RootAfter::Steps(n)) => steps >= n,
+                Some(RootAfter::Real(d)) => started.elapsed() >= d,
+                None => matches!(
+                    (&step.event, root_kind.as_str()),
+                    (Event::Checkpoint { .. }, "auto" | "checkpoint")
+                        | (Event::Begin, "auto" | "begin")
+                ),
+            };
             Ok(if hit { Some(Outcome::Paused) } else { None })
         };
         let outcome = sched::drive(
@@ -653,6 +714,13 @@ pub fn explore(
                 );
                 return Ok(crate::report_code(&outcome));
             }
+        } else if after.is_some() {
+            eprintln!(
+                "[ffs] exploration root after {} steps at virtual time {:.3} s ({} threads)",
+                prefix.steps.len(),
+                session.virtual_ns() as f64 / 1e9,
+                session.alive_tasks().count()
+            );
         } else {
             eprintln!(
                 "[ffs] reached exploration root after {} steps: {}",
@@ -664,6 +732,7 @@ pub fn explore(
 
     // Phase 2: checkpoint the root (a frozen copy); the original is killed so
     // that branches can reuse its canonical thread ids.
+    prefix.ports = session.ports_used.clone();
     let root = session.fork_session(false).context("checkpoint the root")?;
     prefix.steps.push(Step {
         ltid: 0,
@@ -671,6 +740,7 @@ pub fn explore(
         ticks: 0,
         rip: 0,
         effects: None,
+        vt: 0,
     });
     session.kill_all();
     drop(session);

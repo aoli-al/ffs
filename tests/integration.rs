@@ -506,7 +506,13 @@ fn replay_rejects_changed_returns_buffers_and_incomplete_execution() {
     let mut changed = original.clone();
     let read = changed["steps"].as_array_mut().unwrap().iter_mut()
         .find(|s| s["event"]["SyscallExit"]["nr"] == 0).unwrap();
-    read["effects"]["out"][0]["bytes"][0] = serde_json::json!(0);
+    // Small buffers are stored byte for byte, larger ones as (length, hash).
+    let out0 = &mut read["effects"]["out"][0];
+    if out0["bytes"].as_array().is_some_and(|a| !a.is_empty()) {
+        out0["bytes"][0] = serde_json::json!(0);
+    } else {
+        out0["digest"][1] = serde_json::json!(1);
+    }
     std::fs::write(&bad, serde_json::to_vec(&changed).unwrap()).unwrap();
     let (out, text) = run(ffs().args(["replay", "--verify-outputs"]).arg(&bad));
     assert_eq!(out.status.code(), Some(5), "buffer mismatch: {text}");
@@ -527,11 +533,21 @@ fn replay_rejects_changed_returns_buffers_and_incomplete_execution() {
 }
 
 #[test]
-fn timerfd_is_refused_with_virtual_time() {
-    let d = tmpdir("refuse-timerfd");
+fn timerfd_runs_on_the_virtual_clock() {
+    build_tests();
+    let d = tmpdir("timerfd");
     let (out, text) = run(ffs().args(["record", "--ticks", "none", "--policy", "fifo", "-o"])
         .arg(d.join("trace.json")).arg("--").arg(prog("replay_inputs")).arg("timerfd"));
     assert!(out.status.success(), "{text}");
+    // A periodic timerfd read through epoll: 5 expirations of 20 ms take
+    // 100 virtual ms, and the recording replays.
+    let trace = d.join("loop.json");
+    let (out, text) = run(ffs().args(["record", "--seed", "1", "-o"]).arg(&trace).arg("--").arg(prog("timerfd_loop")));
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("OK 5 wakeups 5 expirations"), "{text}");
+    let (out, text) = run(ffs().arg("replay").arg(&trace));
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("replayed all"), "{text}");
 }
 
 #[test]
@@ -631,4 +647,99 @@ fn explore_finds_flink_37663_in_the_jvm() {
         .args(java_args(&java, "fixed", "Flink37663"));
     let (out, text) = run(&mut cmd);
     assert_eq!(out.status.code(), Some(0), "fixed queue failed under exploration:\n{text}");
+}
+
+/// A deadlock next to a periodic timer thread (a JVM always has some): the
+/// process is never "all blocked", so the deadlock is inferred from a long
+/// stretch of timer-only wakeups.  A long one-shot sleep beside the same
+/// timer thread must not be mistaken for one, and the recorded outcome
+/// must replay.
+#[test]
+fn deadlock_is_detected_despite_timer_threads() {
+    build_tests();
+    let (trace, text) = explore_finds("deadlock_timer", "deadlock", 30, &[]);
+    assert!(text.contains("blocked threads [1, 3, 4]"), "{text}");
+    let (out, text) = run(ffs().arg("replay").arg(&trace));
+    assert_eq!(out.status.code(), Some(3), "{text}");
+    assert!(text.contains("DEADLOCK: T1 T3 T4 blocked with no timeout"), "{text}");
+    assert!(text.contains("only the timer-driven threads T2 ran"), "{text}");
+
+    let d = tmpdir("deadlock_timer_sleep");
+    let mut cmd = ffs();
+    cmd.args(["explore", "--iterations", "3", "--seed", "1", "--output-dir"])
+        .arg(&d)
+        .arg("--")
+        .arg(prog("deadlock_timer"))
+        .arg("sleep");
+    let (out, text) = run(&mut cmd);
+    assert_eq!(out.status.code(), Some(0), "a 90 s sleep is not a deadlock:\n{text}");
+    assert!(text.contains("woke up"), "{text}");
+}
+
+/// The same Flink bug with an untimed wait is a deadlock inside a JVM with
+/// its compiler, GC and periodic threads alive.
+#[test]
+fn deadlock_is_detected_in_the_jvm() {
+    let Some(java) = build_java() else { return };
+    let d = tmpdir("flink37663-deadlock");
+    let mut cmd = ffs();
+    cmd.args(["explore", "--iterations", "50", "--seed", "1", "--output-dir"])
+        .arg(&d)
+        .arg("--")
+        .args(java_args(&java, "buggy", "Flink37663"))
+        .arg("notimeout");
+    let (out, text) = run(&mut cmd);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("FAILURE deadlock"), "{text}");
+    assert!(text.contains("re-execution from the checkpoint: reproduced"), "{text}");
+}
+
+/// `--root vtime:SECS` and `--root steps:N` place the checkpoint without
+/// any call into ffs; `record --timeline` prints the virtual times to
+/// choose from.
+#[test]
+fn exploration_roots_at_a_virtual_time_without_the_api() {
+    build_tests();
+    let (out, text) = run(ffs()
+        .args(["record", "--timeline", "-o"])
+        .arg(tmpdir("timeline").join("t.json"))
+        .arg("--")
+        .arg(prog("deadlock_timer"))
+        .arg("sleep"));
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("timeline (virtual s): T1 at 0.000, T2 at 0.0"), "{text}");
+    assert!(text.contains("first write to stdout/stderr at 90."), "{text}");
+
+    let d = tmpdir("root-vtime");
+    let mut cmd = ffs();
+    cmd.args(["explore", "--root", "vtime:0.00001", "--iterations", "30", "--seed", "1", "--output-dir"])
+        .arg(&d)
+        .arg("--")
+        .arg(prog("deadlock_timer"));
+    let (out, text) = run(&mut cmd);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("exploration root after"), "{text}");
+    assert!(text.contains("FAILURE deadlock"), "{text}");
+}
+
+/// A preemption signal pending during `getdents64` makes the kernel return
+/// a single entry; the replay must make the same signal pending at the
+/// same syscall (the trace shows the preemption right after the exit).
+#[test]
+fn signal_shortened_syscall_results_replay() {
+    build_tests();
+    let d = tmpdir("dents");
+    let trace = d.join("t.json");
+    let (out, text) = run(ffs()
+        .args(["record", "--max-insn-steps", "0", "--preempt-prob", "1", "--max-budget", "3000", "--seed", "7", "-o"])
+        .arg(&trace)
+        .arg("--")
+        .arg(prog("dents_loop"))
+        .arg("20000"));
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    let (_, shown) = run(ffs().arg("show").arg(&trace));
+    assert!(shown.contains("-> getdents64 = 24"), "no signal-shortened getdents64 in the recording");
+    let (out, text) = run(ffs().arg("replay").arg(&trace));
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("replayed all"), "{text}");
 }

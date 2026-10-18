@@ -47,6 +47,39 @@ pub fn set_watchpoints(tid: pid_t, addrs: &[u64]) -> Result<()> {
     Ok(())
 }
 
+/// DR7 enabling the given watchpoint slots (same encoding as
+/// `set_watchpoints`).
+fn dr7_for(addrs: &[u64]) -> u64 {
+    let mut dr7 = 0u64;
+    for (i, &a) in addrs.iter().take(4).enumerate() {
+        if a != 0 {
+            dr7 |= 1 << (2 * i);
+            dr7 |= 0b11 << (16 + 4 * i);
+            dr7 |= 0b10 << (18 + 4 * i);
+        }
+    }
+    dr7
+}
+
+/// The debug-register slot a replay uses as an execute breakpoint on the
+/// instruction a preemption was recorded at (`Session::run_task_to`).  It
+/// is free while fewer than four watchpoints are set.
+pub const EXEC_SLOT: usize = 3;
+
+/// Arm `EXEC_SLOT` as an execute breakpoint at `addr` (trapping before the
+/// instruction, with the kernel setting RF so it then executes), keeping
+/// the watchpoints `watch` enabled.  Unlike an `int3` written into the
+/// code it survives the program rewriting that code (a JIT patching its
+/// own output) and costs no memory round trips per hit.
+pub fn arm_exec_breakpoint(tid: pid_t, addr: u64, watch: &[u64]) -> Result<()> {
+    poke_user(tid, DEBUGREG_OFFSET + EXEC_SLOT * 8, addr)?;
+    poke_user(tid, DEBUGREG_OFFSET + 7 * 8, dr7_for(watch) | (1 << (2 * EXEC_SLOT)))
+}
+
+pub fn disarm_exec_breakpoint(tid: pid_t, watch: &[u64]) -> Result<()> {
+    poke_user(tid, DEBUGREG_OFFSET + 7 * 8, dr7_for(watch))
+}
+
 /// Which watchpoint slots the last SIGTRAP of `tid` involved (bit mask of
 /// DR6's B0..B3, cleared afterwards).  A single-step trap over a watched
 /// access reports `TRAP_TRACE` in its siginfo, so the siginfo alone is

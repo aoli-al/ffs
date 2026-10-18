@@ -87,6 +87,15 @@ pub struct SessionOpts {
     pub seed: u64,
     /// Seconds to wait for a blocked thread before declaring a deadlock.
     pub deadlock_timeout: Duration,
+    /// Deadlock detector (virtual time): report a deadlock once this many
+    /// consecutive wakeups were caused by virtual deadlines alone, over at
+    /// least `deadlock_vtime`, while some thread waits with no timeout.
+    /// 0 disables it.
+    pub deadlock_wakes: u64,
+    pub deadlock_vtime: Duration,
+    /// Virtual time after which a run that has not ended is a `Hang`
+    /// (0 = unlimited).
+    pub max_vtime: Duration,
     /// Environment and working directory for the tracee (None: inherit).
     /// A replay sets them from the trace: the environment is an input the
     /// dynamic loader and libc parse, so it changes tick counts.
@@ -104,6 +113,9 @@ pub struct SessionOpts {
 impl Default for SessionOpts {
     fn default() -> Self {
         SessionOpts {
+            deadlock_wakes: 200,
+            deadlock_vtime: Duration::from_secs(30),
+            max_vtime: Duration::from_secs(300),
             virtual_time: false,
             virtual_random: true,
             isolate_files: false,
@@ -190,11 +202,46 @@ pub struct Session {
     /// The last `Preempt` event came from a watchpoint (the scheduling
     /// point is the access itself; no instruction steps are added).
     pub watch_preempt: bool,
+    /// Progress bookkeeping for the deadlock detector.
+    pub progress: Progress,
+    /// Virtual time at which each thread was created.
+    pub created_at: BTreeMap<Ltid, u64>,
+    /// Virtual time of the first write to stdout or stderr.
+    pub first_output: Option<u64>,
+    /// Replay: threads given a pending preemption signal before a syscall
+    /// (`Decision::RunPending`); the signal stop that follows the syscall
+    /// exit is the recorded `Preempt`.
+    pub prearmed: std::collections::BTreeSet<pid_t>,
+    /// Ports chosen for `bind`s to port 0 so far, the recorded plan a
+    /// replay follows, and the next port to hand out.
+    pub ports_used: Vec<u16>,
+    pub port_plan: Option<Vec<u16>>,
+    pub next_port: u16,
     /// The last stop was the slice cap's PTRACE_INTERRUPT (see `wait_task`).
     pub cap_preempt: bool,
 }
 
 const CLOCK_GETTIME: u64 = 228;
+/// Deadline wakeups after which a thread counts as periodic housekeeping
+/// for the deadlock detector.
+const PERIODIC_WAKES: u32 = 3;
+const BIND: u64 = 49;
+const AF_INET: u16 = 2;
+const AF_INET6: u16 = 10;
+/// Ports handed out for `bind(port 0)`, cycling through a range the kernel
+/// does not use for its own ephemeral ports (32768-60999 by default).
+const FIRST_PORT: u16 = 20000;
+const LAST_PORT: u16 = 29999;
+/// The x86 resume flag.
+const X86_RF: u64 = 1 << 16;
+const KILL: u64 = 62;
+const TKILL: u64 = 200;
+const TGKILL: u64 = 234;
+const RT_SIGQUEUEINFO: u64 = 129;
+const RT_TGSIGQUEUEINFO: u64 = 297;
+const PIDFD_SEND_SIGNAL: u64 = 424;
+const WRITE: u64 = 1;
+const WRITEV: u64 = 20;
 const RESTART_SYSCALL: u64 = 219;
 /// `si_code` of a SIGTRAP caused by the trap flag.
 const TRAP_TRACE: i32 = 2;
@@ -226,7 +273,159 @@ pub enum WaitOutcome {
     Blocked,
 }
 
+/// What the deadlock detector knows about progress.  "Progress" is any
+/// wakeup not caused by a virtual deadline: a blocked thread completing its
+/// syscall in the kernel (woken by another thread, I/O, a child), a thread
+/// being created or exiting.  Wakeups by deadline (sleeps, timeouts,
+/// periodic timers) are counted separately: a JVM, for instance, always has
+/// threads waking every few milliseconds, so "every thread is blocked"
+/// never holds and a deadlock has to be inferred from nothing else
+/// happening for a long time.
+#[derive(Clone, Debug, Default)]
+pub struct Progress {
+    /// Virtual time of the last progress event.
+    pub since_ns: u64,
+    /// Deadline wakeups since then.
+    pub timer_wakes: u64,
+    /// Deadline wakeups per thread since then.  A thread that keeps
+    /// waking on deadlines is housekeeping; one with a pending deadline
+    /// and fewer than `PERIODIC_WAKES` wakeups may be waiting out a
+    /// one-shot delay (a 60 s timeout task) that will do something.
+    pub timer_woken: BTreeMap<Ltid, u32>,
+    /// Threads currently waiting with no deadline, with (timer wakes,
+    /// virtual time) when they were first seen waiting; a thread that
+    /// stops waiting is removed, so this measures the age of the current
+    /// wait.
+    pub untimed_since: BTreeMap<Ltid, (u64, u64)>,
+}
+
+/// A detected deadlock: the threads waiting with no timeout, the threads
+/// that kept waking on timers, and how long nothing else happened.
+#[derive(Clone, Debug)]
+pub struct DeadlockInfo {
+    pub blocked: Vec<Ltid>,
+    pub timers: Vec<Ltid>,
+    pub vtime_ns: u64,
+    pub wakes: u64,
+}
+
 impl Session {
+    /// Something other than a virtual deadline made a thread runnable.
+    pub fn note_progress(&mut self) {
+        self.progress.since_ns = self.virtual_ns();
+        self.progress.timer_wakes = 0;
+        self.progress.timer_woken.clear();
+        for tm in &mut self.vtimers {
+            tm.fires = 0;
+        }
+    }
+
+    /// A thread was woken by its virtual deadline.
+    pub fn note_timer_wake(&mut self, ltid: Ltid) {
+        self.progress.timer_wakes += 1;
+        *self.progress.timer_woken.entry(ltid).or_insert(0) += 1;
+    }
+
+    /// Called when no thread is runnable: is this a deadlock?  Yes when
+    /// some thread waits with no deadline, every thread that does have a
+    /// deadline has already woken on it at least once since the last
+    /// progress (so no one-shot sleep is still pending), and for
+    /// `deadlock_wakes` deadline wakeups and `deadlock_vtime` of virtual
+    /// time nothing else happened.
+    pub fn deadlock_check(&mut self) -> Option<DeadlockInfo> {
+        if !self.opts.virtual_time || self.opts.deadlock_wakes == 0 {
+            return None;
+        }
+        let mut blocked = Vec::new();
+        let mut timers = Vec::new();
+        let now = self.virtual_ns();
+        // A deadline beyond --max-vtime never arrives: the run is a hang
+        // before then, so it does not protect against a deadlock verdict.
+        let horizon = if self.opts.max_vtime.is_zero() { u64::MAX } else { self.opts.max_vtime.as_nanos() as u64 };
+        let mut pending: Vec<(Ltid, u64)> = Vec::new();
+        for t in self.alive_tasks() {
+            if !matches!(t.state, State::Blocked { .. }) {
+                continue;
+            }
+            let deadline = match t.vblock {
+                Some(vb) => vb.deadline,
+                None => t.vdeadline.map(|d| d.0),
+            };
+            match deadline {
+                Some(d) => {
+                    timers.push(t.ltid);
+                    if d <= horizon {
+                        pending.push((t.ltid, d));
+                    }
+                }
+                None => blocked.push(t.ltid),
+            }
+        }
+        let wakes = self.progress.timer_wakes;
+        let p = &mut self.progress;
+        p.untimed_since.retain(|l, _| blocked.contains(l));
+        for l in &blocked {
+            p.untimed_since.entry(*l).or_insert((wakes, now));
+        }
+        if blocked.is_empty() {
+            return None;
+        }
+        let need_wakes = self.opts.deadlock_wakes;
+        let need_ns = self.opts.deadlock_vtime.as_nanos() as u64;
+        // Every untimed wait must be old: seen across `need_wakes` timer
+        // wakeups and `need_ns` of virtual time with nothing else
+        // happening (progress resets the counters, so a wait that began
+        // before the last progress is aged from that point).
+        let (w0, t0) = blocked
+            .iter()
+            .map(|l| p.untimed_since[l])
+            .fold((0u64, 0u64), |(w, t), (w1, t1)| (w.max(w1), t.max(t1)));
+        let t0 = t0.max(p.since_ns);
+        if wakes.saturating_sub(w0) < need_wakes || now.saturating_sub(t0) < need_ns {
+            log::debug!(
+                "deadlock check: {blocked:?} untimed, {} wakes / {:.1} s since the newest wait or progress (need {need_wakes} / {:.1} s)",
+                wakes.saturating_sub(w0),
+                now.saturating_sub(t0) as f64 / 1e9,
+                need_ns as f64 / 1e9
+            );
+            return None;
+        }
+        if let Some(tm) = self.vtimers.iter().find(|tm| {
+            tm.deadline.is_some_and(|d| d <= horizon)
+                && tm.fires < PERIODIC_WAKES
+                && !matches!(tm.kind, crate::vtime::TimerKind::Posix { notify: 1, .. })
+        }) {
+            log::debug!("deadlock check: a timer ({:?}) is pending and not periodic yet", tm.kind);
+            return None;
+        }
+        if let Some((l, d)) = pending.iter().find(|(l, _)| p.timer_woken.get(l).copied().unwrap_or(0) < PERIODIC_WAKES) {
+            log::debug!(
+                "deadlock check: T{l} has a deadline at {:.1} s and is not periodic yet (now {:.1} s)",
+                *d as f64 / 1e9,
+                now as f64 / 1e9
+            );
+            return None;
+        }
+        Some(DeadlockInfo {
+            blocked,
+            timers,
+            vtime_ns: now - t0,
+            wakes: wakes - w0,
+        })
+    }
+
+    /// Has the run exceeded `--max-vtime`?  Returns (virtual ns, runnable,
+    /// blocked).
+    pub fn hang_check(&self) -> Option<(u64, Vec<Ltid>, Vec<Ltid>)> {
+        if !self.opts.virtual_time || self.opts.max_vtime.is_zero() {
+            return None;
+        }
+        let now = self.virtual_ns();
+        if now < self.opts.max_vtime.as_nanos() as u64 {
+            return None;
+        }
+        Some((now, self.enabled(), self.blocked()))
+    }
     /// Spawn `argv[0]` under ptrace and return a session with its main thread
     /// stopped at the syscall-exit of the initial execve (ready to run).
     pub fn spawn(argv: &[String], pmu: PmuConfig, opts: SessionOpts) -> Result<Session> {
@@ -332,6 +531,7 @@ impl Session {
         unsafe { libc::close(fds[1]) };
 
         let vrandom = VirtualRandom::new(opts.seed);
+        let first_port = FIRST_PORT + ((opts.seed % 200) as u16) * 50;
         let mut session = Session {
             cpu_online: None,
             tasks: BTreeMap::new(),
@@ -368,6 +568,15 @@ impl Session {
             watch_disabled: 0,
             file_snapshots: BTreeMap::new(),
             watch_preempt: false,
+            progress: Progress::default(),
+            created_at: BTreeMap::new(),
+            first_output: None,
+            prearmed: std::collections::BTreeSet::new(),
+            ports_used: Vec::new(),
+            port_plan: None,
+            // Concurrent sessions on one host start in different parts of
+            // the range (a replay follows its recorded plan anyway).
+            next_port: first_port,
             cap_preempt: false,
         };
         // Wait for the exec event.  Before it the child runs our own code.
@@ -517,6 +726,9 @@ impl Session {
         }
         self.ltids.insert(ltid, child);
         self.tasks.insert(child, t);
+        let now = self.virtual_ns();
+        self.created_at.insert(ltid, now);
+        self.note_progress();
         log::debug!("new task tid={child} tgid={tgid} ltid={ltid} (parent {parent})");
         self.check_ns_pid(child, ltid);
         if initial.is_some() {
@@ -591,9 +803,14 @@ impl Session {
                 });
             }
             match ptrace::proc_state(tid) {
-                Some('S') | Some('D') if allow_block => {
+                Some('S') | Some('D') if allow_block || sleeping_since.is_some_and(|s| s.elapsed() >= self.opts.deadlock_timeout) => {
                     // Blocked in the kernel.  Give it a grace period so that
                     // syscalls that merely sleep briefly are not misclassified.
+                    // A thread that was not expected to block (resumed
+                    // through user code, `allow_block` false) but sleeps for
+                    // as long as a deadlock is reported blocked too, so a
+                    // replay that went wrong reports a divergence instead of
+                    // waiting forever.
                     let since = *sleeping_since.get_or_insert_with(Instant::now);
                     // In a replay the trace says whether the syscall blocks
                     // (a `Blocked` step is replayed without waiting), so a
@@ -628,6 +845,9 @@ impl Session {
                     self.zombies.push(tid);
                     return Ok(WaitOutcome::Exited);
                 }
+                Some('S') | Some('D') => {
+                    sleeping_since.get_or_insert_with(Instant::now);
+                }
                 _ => {
                     sleeping_since = None;
                 }
@@ -638,68 +858,39 @@ impl Session {
     /// Poll blocked tasks and pick up any that completed.  Also notices
     /// asynchronous state changes (e.g. a stopped thread killed by exit_group).
     pub fn settle(&mut self) -> Result<()> {
-        let tids: Vec<pid_t> = self
-            .tasks
-            .values()
-            .filter(|t| t.is_alive())
-            .map(|t| t.tid)
-            .collect();
+        // One sweep for every status the kernel has for us, then a lookup
+        // per task: a thread that completed its blocking syscall, or was
+        // killed, reports a stop or an exit here.
+        ptrace::drain_statuses()?;
+        let tids: Vec<pid_t> = self.tasks.values().filter(|t| t.is_alive()).map(|t| t.tid).collect();
         for tid in tids {
+            let Some(st) = ptrace::take_stashed(tid) else { continue };
             let state = self.task(tid)?.state;
             match state {
-                State::Blocked { .. } if self.task(tid)?.vblock.is_some() => {
-                    // Parked by us in a ptrace stop; it can still be killed
-                    // (exit_group of a sibling) and report an exit stop.
-                    if let Some(st) = ptrace::try_wait_tid(tid)? {
-                        let t = self.task_mut(tid)?;
-                        t.vblock = None;
-                        t.vwait = None;
-                        if t.did_wait(st)?.is_some() {
-                            t.unreported = true;
-                        }
-                    }
-                }
                 State::Blocked { .. } => {
-                    // A thread that was just woken is briefly 'R' before it
-                    // reaches its stop; wait for that to be observable.
-                    let start = Instant::now();
-                    loop {
-                        if let Some(st) = ptrace::try_wait_tid(tid)? {
-                            let t = self.task_mut(tid)?;
-                            if t.did_wait(st)?.is_some() {
-                                t.unreported = true;
-                            }
-                            break;
-                        }
-                        match ptrace::proc_state(tid) {
-                            Some('R') | Some('t') | Some('T')
-                                if start.elapsed() < Duration::from_millis(20) =>
-                            {
-                                std::thread::sleep(Duration::from_micros(20));
-                            }
-                            Some('Z') | Some('X') | None => {
-                                let t = self.task_mut(tid)?;
-                                t.state = State::Exited;
-                                if t.exit_code.is_none() {
-                                    t.exit_code = Some(0);
-                                }
-                                self.zombies.push(tid);
-                                break;
-                            }
-                            _ => break,
-                        }
+                    let t = self.task_mut(tid)?;
+                    // Parked by us (virtual block) or blocked in the kernel:
+                    // either way it now has a real status.
+                    t.vblock = None;
+                    t.vwait = None;
+                    if t.did_wait(st)?.is_some() {
+                        t.unreported = true;
                     }
+                    // Woken in the kernel by someone (or killed).
+                    self.note_progress();
                 }
                 State::Stopped(_) => {
-                    if let Some(st) = ptrace::try_wait_tid(tid)? {
-                        // Asynchronous change (SIGKILL / exit_group).
-                        let t = self.task_mut(tid)?;
-                        if t.did_wait(st)?.is_some() {
-                            t.unreported = true;
-                        }
+                    // Asynchronous change (SIGKILL / exit_group).
+                    let t = self.task_mut(tid)?;
+                    if t.did_wait(st)?.is_some() {
+                        t.unreported = true;
                     }
                 }
-                _ => {}
+                State::Running => {
+                    // Not ours to consume here (someone is waiting for it).
+                    ptrace::stash(tid, st);
+                }
+                State::Exited => {}
             }
         }
         self.reap_zombies();
@@ -734,6 +925,38 @@ impl Session {
         }
     }
 
+    /// Is a thread we consider blocked actually running in the kernel on
+    /// its way to a ptrace stop (just woken)?  Waits for such threads to
+    /// arrive so that an idle jump of the virtual clock is not taken while
+    /// a wakeup is in flight.  The bound only matters on a machine so
+    /// loaded that a woken thread needs that long to reach its stop; a
+    /// replay, which knows the wakeup is coming, waits as long as for a
+    /// deadlock.
+    fn wait_in_flight(&mut self) -> Result<bool> {
+        let start = Instant::now();
+        let bound = if self.replay { self.opts.deadlock_timeout } else { Duration::from_millis(500) };
+        loop {
+            let in_flight: Vec<pid_t> = self
+                .tasks
+                .values()
+                .filter(|t| matches!(t.state, State::Blocked { .. }) && t.vblock.is_none())
+                .filter(|t| matches!(ptrace::proc_state(t.tid), Some('R') | Some('t') | Some('T')))
+                .map(|t| t.tid)
+                .collect();
+            if in_flight.is_empty() {
+                return Ok(false);
+            }
+            if start.elapsed() >= bound {
+                return Ok(true);
+            }
+            std::thread::sleep(Duration::from_micros(20));
+            self.settle()?;
+            if !self.enabled().is_empty() {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Logical ids of tasks that are stopped (can be resumed now), in ltid order.
     pub fn enabled(&self) -> Vec<Ltid> {
         // Threads of a process in an emulated group stop are not runnable.
@@ -759,6 +982,22 @@ impl Session {
         v
     }
 
+    /// Replay: wait (real time) for a blocked thread's syscall to complete,
+    /// without jumping the virtual clock.  Returns false on timeout.
+    pub fn wait_for_completion(&mut self) -> Result<bool> {
+        let start = Instant::now();
+        loop {
+            self.settle()?;
+            if !self.enabled().is_empty() || self.all_exited() {
+                return Ok(true);
+            }
+            if start.elapsed() > self.opts.deadlock_timeout {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
     /// Block until at least one task is enabled, or the deadlock timeout
     /// expires.  Returns false on timeout.
     pub fn wait_for_any_enabled(&mut self) -> Result<bool> {
@@ -768,6 +1007,10 @@ impl Session {
             self.settle()?;
             if !self.enabled().is_empty() || self.all_exited() {
                 return Ok(true);
+            }
+            // A wakeup in flight is not idleness.
+            if self.wait_in_flight()? {
+                continue;
             }
             // Virtual time: jump to the next deadline instead of waiting.
             if advances < 100_000 && self.vt_advance_idle()? {
@@ -813,12 +1056,18 @@ impl Session {
                     if !t.is_stopped() {
                         // Blocked in the kernel with a deadline not yet
                         // reached: it may still complete for real.
+                        self.note_progress();
                         match self.wait_task(tid, false)? {
                             WaitOutcome::Exited => {
                                 let code = self.task(tid)?.exit_code.unwrap_or(0);
                                 return Ok(Event::Exited { code });
                             }
-                            WaitOutcome::Blocked => unreachable!(),
+                            WaitOutcome::Blocked => {
+                            // Not expected to block here (a replay that no
+                            // longer follows its trace): report it.
+                            let nr = self.task(tid)?.syscall_nr;
+                            return Ok(Event::Blocked { nr });
+                        }
                             WaitOutcome::Stopped(stop) => {
                                 if let Some(ev) = self.handle_stop(tid, stop)? {
                                     return Ok(ev);
@@ -835,7 +1084,12 @@ impl Session {
                             let code = self.task(tid)?.exit_code.unwrap_or(0);
                             return Ok(Event::Exited { code });
                         }
-                        WaitOutcome::Blocked => unreachable!(),
+                        WaitOutcome::Blocked => {
+                            // Not expected to block here (a replay that no
+                            // longer follows its trace): report it.
+                            let nr = self.task(tid)?.syscall_nr;
+                            return Ok(Event::Blocked { nr });
+                        }
                         WaitOutcome::Stopped(stop) => {
                             if let Some(ev) = self.handle_stop(tid, stop)? {
                                 return Ok(ev);
@@ -986,6 +1240,34 @@ impl Session {
                 self.task_mut(tid)?.restarting = true;
                 Ok(None)
             }
+            Stop::SyscallExit { nr: BIND, ret }
+                if ret == -(libc::EADDRINUSE as i64)
+                    && self.task(tid)?.bound_port.is_some()
+                    && self.task(tid)?.port_tries < 200
+                    && !self.port_planned() =>
+            {
+                // The host has our port in use: try the next one, with the
+                // syscall re-executed invisibly (as a kernel restart is).
+                let p = self.fresh_port();
+                if let Some(last) = self.ports_used.last_mut() {
+                    *last = p;
+                }
+                let t = self.task_mut(tid)?;
+                let addr = t.mem_restore.as_ref().map(|(a, _)| *a).unwrap_or(0);
+                t.mem.write(addr, &p.to_be_bytes())?;
+                t.bound_port = Some(p);
+                t.port_tries += 1;
+                let mut r = t.regs()?;
+                r.rip -= ptrace::SYSCALL_INSN_LEN;
+                r.rax = BIND;
+                r.orig_rax = BIND;
+                t.set_regs(&r)?;
+                t.in_syscall = false;
+                t.restarting = true;
+                t.rewound = true;
+                t.state = State::Stopped(Stop::Parked);
+                Ok(None)
+            }
             Stop::SyscallExit { nr, ret: _ } => {
                 if self.task(tid)?.entry_regs.is_some() || self.task(tid)?.vdeadline.is_some() || self.task(tid)?.mem_restore.is_some() {
                     self.vt_syscall_done(tid)?;
@@ -1046,6 +1328,15 @@ impl Session {
                     } else {
                         Some((r.rdi, r.rsi, r.r10))
                     };
+                }
+                if matches!(nr, KILL | TKILL | TGKILL | RT_SIGQUEUEINFO | RT_TGSIGQUEUEINFO | PIDFD_SEND_SIGNAL) {
+                    ptrace::note_signal_sent();
+                }
+                if self.first_output.is_none() && matches!(nr, WRITE | WRITEV) && ret > 0 {
+                    let fd = self.task_mut(tid)?.regs()?.rdi;
+                    if fd == 1 || fd == 2 {
+                        self.first_output = Some(self.virtual_ns());
+                    }
                 }
                 let child = self.task_mut(tid)?.last_child.take();
                 Ok(Some(Event::SyscallExit { nr, ret, child }))
@@ -1238,6 +1529,76 @@ impl Session {
         }
     }
 
+    /// Replay: queue ffs's preemption signal for `ltid`, stopped at a
+    /// syscall entry, so the kernel sees a pending signal during the
+    /// syscall exactly as in the recording.
+    pub fn prearm_preempt(&mut self, ltid: Ltid) -> Result<()> {
+        let tid = self.tid_of(ltid)?;
+        let tgid = self.task(tid)?.tgid;
+        ptrace::tgkill(tgid, tid, TIME_SLICE_SIGNAL)?;
+        self.prearmed.insert(tid);
+        Ok(())
+    }
+
+    /// The port for the next `bind` to port 0: the recorded one in a
+    /// replay, otherwise the next of the range.
+    fn choose_port(&mut self) -> u16 {
+        let i = self.ports_used.len();
+        let p = match &self.port_plan {
+            Some(plan) if i < plan.len() => plan[i],
+            _ => self.fresh_port(),
+        };
+        self.ports_used.push(p);
+        p
+    }
+
+    fn fresh_port(&mut self) -> u16 {
+        let p = self.next_port;
+        self.next_port = if p >= LAST_PORT { FIRST_PORT } else { p + 1 };
+        p
+    }
+
+    /// Was the last chosen port dictated by a replay's plan?
+    fn port_planned(&self) -> bool {
+        self.port_plan.as_ref().is_some_and(|plan| self.ports_used.len() <= plan.len())
+    }
+
+    /// An ephemeral port the kernel picks for `bind(port 0)` is live state
+    /// the program then prints, parses and sends to its peers, so ffs
+    /// picks the port instead (deterministically, and recorded in the
+    /// trace).  The sockaddr in the tracee is rewritten for the duration
+    /// of the syscall; a port the host happens to have in use is retried
+    /// with the next one without the program seeing it.
+    fn net_pre_syscall(&mut self, tid: pid_t, nr: u64) -> Result<()> {
+        if nr != BIND {
+            return Ok(());
+        }
+        let t = self.task_mut(tid)?;
+        if t.mem_restore.is_some() {
+            return Ok(()); // a retry re-entering with our port in place
+        }
+        let r = t.regs()?;
+        let (addr, len) = (r.rsi, r.rdx);
+        if len < 4 {
+            return Ok(());
+        }
+        let mut hdr = [0u8; 4];
+        if t.mem.read(addr, &mut hdr).is_err() {
+            return Ok(());
+        }
+        let family = u16::from_ne_bytes([hdr[0], hdr[1]]);
+        if (family != AF_INET && family != AF_INET6) || hdr[2] != 0 || hdr[3] != 0 {
+            return Ok(());
+        }
+        let p = self.choose_port();
+        let t = self.task_mut(tid)?;
+        t.mem.write(addr + 2, &p.to_be_bytes())?;
+        t.mem_restore = Some((addr + 2, vec![0, 0]));
+        t.bound_port = Some(p);
+        t.port_tries = 0;
+        Ok(())
+    }
+
     fn pre_syscall(&mut self, _tid: pid_t, nr: u64) -> Result<()> {
         // These interfaces permit writes outside traced syscall boundaries.
         // Refuse setup/submission before they can create asynchronous state.
@@ -1259,6 +1620,7 @@ impl Session {
         self.file_pre_syscall(_tid, nr)?;
         self.proc_pre_syscall(_tid, nr)?;
         self.sigmask_pre_syscall(_tid, nr)?;
+        self.net_pre_syscall(_tid, nr)?;
         if self.opts.virtual_time {
             self.cpu_file_pre_syscall(_tid, nr)?;
         }
@@ -1275,12 +1637,6 @@ impl Session {
                     t.set_regs(&n)?;
                     t.entry_regs = Some(r);
                 }
-            }
-            if matches!(nr, 283 | 286 | 287) {
-                // timerfd counters and poll readiness still use host time.
-                // Refuse until they have a virtual-clock implementation.
-                self.emulate_syscall(_tid, Emulation::Ret(-(libc::ENOSYS as i64)))?;
-                return Ok(());
             }
             if nr == RSEQ {
                 // The kernel keeps the current cpu number in the rseq area,
@@ -1347,13 +1703,11 @@ impl Session {
             _ => return Ok(()),
         };
         let Ok(path) = t.mem.read_cstr(ptr, 64) else { return Ok(()) };
-        if path != "/sys/devices/system/cpu/online" {
-            return Ok(());
-        }
+        let Some(content) = canonical_file(&path) else { return Ok(()) };
         if self.cpu_online.is_none() {
             self.cpu_online = Some(Rc::new(CpuOnline::new()?));
         }
-        let new = format!("{}\0", self.cpu_online.as_ref().unwrap().0);
+        let new = format!("{}\0", self.cpu_online.as_ref().unwrap().path_for(content)?);
         let t = self.task_mut(tid)?;
         let mut old = vec![0u8; new.len()];
         t.mem.read(ptr, &mut old)?;
@@ -1401,6 +1755,9 @@ impl Session {
 
     /// Overwrite the result of time-related syscalls with virtual time.
     fn virtualize_time_result(&mut self, tid: pid_t, nr: u64) -> Result<()> {
+        if matches!(nr, 283 | 3) {
+            self.vt_timerfd_exit(tid, nr)?;
+        }
         let now = self.virtual_ns();
         let base_rt = self.vclock.base_realtime_ns;
         let base_mono = self.vclock.base_monotonic_ns;
@@ -1588,6 +1945,28 @@ impl Session {
                 }
             }
         }
+        // The trace says the syscall blocks; make sure the thread really is
+        // asleep in the kernel before the schedule moves on.  Otherwise the
+        // next thread's wakeup (a futex wake recorded as waking one waiter)
+        // can run before this one has queued itself and wake nobody.
+        let start = Instant::now();
+        loop {
+            if let Some(st) = ptrace::try_wait_tid(tid)? {
+                // It completed (or died) at once; the recording saw that
+                // later, as an asynchronous stop.
+                let t = self.task_mut(tid)?;
+                if t.did_wait(st)?.is_some() {
+                    t.unreported = true;
+                }
+                return Ok(Event::Blocked { nr });
+            }
+            match ptrace::proc_state(tid) {
+                Some('S') | Some('D') => break,
+                Some('Z') | Some('X') | None => break,
+                _ if start.elapsed() > self.opts.deadlock_timeout => break,
+                _ => std::thread::sleep(Duration::from_micros(10)),
+            }
+        }
         self.task_mut(tid)?.state = State::Blocked { nr };
         Ok(Event::Blocked { nr })
     }
@@ -1635,6 +2014,25 @@ impl Session {
                 return Ok(Event::Preempt);
             }
             let cur_rip = t.rip();
+            if cur == ticks && cur_rip == rip && self.prearmed.remove(&tid) && signal.is_none() {
+                // The preemption signal queued before the syscall is
+                // delivered now that it returned: that stop is the
+                // recorded preemption.
+                let t = self.task_mut(tid)?;
+                t.resume(ResumeHow::Syscall, 0)?;
+                return Ok(match self.wait_task(tid, false)? {
+                    WaitOutcome::Exited => {
+                        let code = self.task(tid)?.exit_code.unwrap_or(0);
+                        Event::Exited { code }
+                    }
+                    WaitOutcome::Blocked => {
+                        let nr = self.task(tid)?.syscall_nr;
+                        Event::Blocked { nr }
+                    }
+                    WaitOutcome::Stopped(stop) => self.handle_stop(tid, stop)?.unwrap_or(Event::Preempt),
+                });
+            }
+            let t = self.task_mut(tid)?;
             if cur == ticks && cur_rip == rip {
                 // Make the state canonical.
                 if let State::Stopped(Stop::Signal { sig }) = t.state {
@@ -1649,8 +2047,13 @@ impl Session {
                 return Ok(Event::Preempt);
             }
             let remaining = ticks - cur;
-            if remaining > skid {
-                // Fast approach: let the counter interrupt us `skid` ticks early.
+            // Approach the target with the counter, `skid` ticks early (the
+            // interrupt can land that late under load; a smaller second
+            // stage overshot in practice).  The last window is covered by
+            // a hardware breakpoint on the target instruction, one ptrace
+            // round trip per hit.
+            let margin = skid;
+            if remaining > margin {
                 let stop = t.stop().unwrap();
                 let (how, allow_block, budget) = match stop {
                     Stop::SyscallEntry { nr } => {
@@ -1659,7 +2062,7 @@ impl Session {
                     }
                     Stop::CloneEvent { .. } => (ResumeHow::Syscall, true, 0),
                     Stop::ExitEvent => (ResumeHow::Cont, false, 0),
-                    _ => (ResumeHow::Syscall, false, remaining - skid),
+                    _ => (ResumeHow::Syscall, false, remaining - margin),
                 };
                 self.task_mut(tid)?.resume(how, budget)?;
                 match self.wait_task(tid, allow_block)? {
@@ -1677,18 +2080,28 @@ impl Session {
                     },
                 }
             }
-            // Precise approach: single-step while at the target rip (we must
-            // leave it before a breakpoint there is useful), otherwise plant a
-            // breakpoint on the target rip and continue.
+            // Precise approach.  With a hardware execute breakpoint on the
+            // target, arriving there early is cheap to get past: the
+            // resume flag lets the instruction execute once without
+            // re-trapping, so the thread is simply continued.  Otherwise
+            // (int3) the thread must be single-stepped off the target
+            // before a breakpoint there is useful; the last tick is always
+            // single-stepped, and a syscall instruction at the target is
+            // run one stop at a time.
+            let hw_bp = self.watchpoints.len() < 4;
+            let mut insn = [0u8; 2];
             if cur_rip == rip || remaining <= 1 {
-                let mut insn = [0u8; 2];
                 let t = self.task_mut(tid)?;
                 // Unreadable (a jump to a bad address about to fault): not
                 // a syscall instruction.
                 let _ = t.mem.read(cur_rip, &mut insn);
-                if insn == ptrace::SYSCALL_INSN
-                    || matches!(t.stop(), Some(Stop::SyscallEntry { .. }))
-                {
+            }
+            let at_syscall = (cur_rip == rip || remaining <= 1)
+                && (insn == ptrace::SYSCALL_INSN || matches!(self.task(tid)?.stop(), Some(Stop::SyscallEntry { .. })));
+            let must_step = remaining <= 1 || (cur_rip == rip && !hw_bp);
+            if at_syscall || must_step {
+                let t = self.task_mut(tid)?;
+                if at_syscall {
                     // The next thing is a syscall.  Run it one stop at a
                     // time: a visible event is returned for the caller to
                     // compare against the trace; an invisible one (the exit
@@ -1722,11 +2135,81 @@ impl Session {
                         let code = self.task(tid)?.exit_code.unwrap_or(0);
                         return Ok(Event::Exited { code });
                     }
-                    WaitOutcome::Blocked => unreachable!(),
+                    WaitOutcome::Blocked => {
+                            // Not expected to block here (a replay that no
+                            // longer follows its trace): report it.
+                            let nr = self.task(tid)?.syscall_nr;
+                            return Ok(Event::Blocked { nr });
+                        }
                     WaitOutcome::Stopped(Stop::Signal { sig }) if sig == libc::SIGTRAP => {
                         let t = self.task_mut(tid)?;
                         t.state = State::Stopped(Stop::Parked);
                         continue;
+                    }
+                    WaitOutcome::Stopped(stop) => match self.handle_stop(tid, stop)? {
+                        None | Some(Event::Preempt) => continue,
+                        Some(ev) => return Ok(ev),
+                    },
+                }
+            } else if hw_bp {
+                // Hardware execute breakpoint on the target (stays armed
+                // across hits; the next ordinary resume disarms it).
+                let watch = self.watchpoints.clone();
+                let t = self.task_mut(tid)?;
+                if t.exec_bp != Some(rip) {
+                    crate::watch::arm_exec_breakpoint(tid, rip, &watch)?;
+                    t.exec_bp = Some(rip);
+                    t.watch_addrs = watch;
+                }
+                if cur_rip == rip {
+                    // At the target too early: make sure the resume flag
+                    // is set (the kernel sets it after a breakpoint trap,
+                    // not after a step or a counter interrupt) so the
+                    // instruction executes instead of trapping again.
+                    let mut r = t.regs()?;
+                    if r.eflags & X86_RF == 0 {
+                        r.eflags |= X86_RF;
+                        t.set_regs(&r)?;
+                    }
+                }
+                let stop = t.stop().unwrap();
+                let allow_block = matches!(stop, Stop::SyscallEntry { .. });
+                if let Stop::SyscallEntry { nr } = stop {
+                    self.pre_syscall(tid, nr)?;
+                }
+                let t = self.task_mut(tid)?;
+                let how = if stop == Stop::ExitEvent { ResumeHow::Cont } else { ResumeHow::Syscall };
+                t.keep_exec_bp = true;
+                let r = t.resume(how, 0);
+                t.keep_exec_bp = false;
+                r?;
+                match self.wait_task(tid, allow_block)? {
+                    WaitOutcome::Exited => {
+                        let code = self.task(tid)?.exit_code.unwrap_or(0);
+                        return Ok(Event::Exited { code });
+                    }
+                    WaitOutcome::Blocked => {
+                        let nr = self.task(tid)?.syscall_nr;
+                        return Ok(Event::Blocked { nr });
+                    }
+                    WaitOutcome::Stopped(Stop::Signal { sig }) if sig == libc::SIGTRAP => {
+                        // Our breakpoint, or a watchpoint of the
+                        // exploration (then DR6 says which; with none set
+                        // the trap at the target is ours).
+                        let hit = if self.watchpoints.is_empty() {
+                            self.task_mut(tid)?.rip() == rip
+                        } else {
+                            crate::watch::watchpoint_hits(tid) & (1 << crate::watch::EXEC_SLOT) != 0
+                        };
+                        let t = self.task_mut(tid)?;
+                        if hit {
+                            t.state = State::Stopped(Stop::Parked);
+                            continue;
+                        }
+                        // Some other trap (e.g. the tracee's own int3).
+                        t.pending_sig = sig;
+                        let info = ptrace::get_siginfo(tid).map(|i| ptrace::siginfo_to_hex(&i)).unwrap_or_default();
+                        return Ok(Event::Signal { sig, info });
                     }
                     WaitOutcome::Stopped(stop) => match self.handle_stop(tid, stop)? {
                         None | Some(Event::Preempt) => continue,
@@ -1745,7 +2228,12 @@ impl Session {
                             let code = self.task(tid)?.exit_code.unwrap_or(0);
                             return Ok(Event::Exited { code });
                         }
-                        WaitOutcome::Blocked => unreachable!(),
+                        WaitOutcome::Blocked => {
+                            // Not expected to block here (a replay that no
+                            // longer follows its trace): report it.
+                            let nr = self.task(tid)?.syscall_nr;
+                            return Ok(Event::Blocked { nr });
+                        }
                         WaitOutcome::Stopped(Stop::Signal { sig }) if sig == libc::SIGTRAP => {
                             self.task_mut(tid)?.state = State::Stopped(Stop::Parked);
                             continue;
@@ -1828,7 +2316,12 @@ impl Session {
                     let code = self.task(tid)?.exit_code.unwrap_or(0);
                     return Ok(Event::Exited { code });
                 }
-                WaitOutcome::Blocked => unreachable!(),
+                WaitOutcome::Blocked => {
+                            // Not expected to block here (a replay that no
+                            // longer follows its trace): report it.
+                            let nr = self.task(tid)?.syscall_nr;
+                            return Ok(Event::Blocked { nr });
+                        }
                 WaitOutcome::Stopped(Stop::Signal { sig }) if sig == libc::SIGTRAP => {
                     self.task_mut(tid)?.state = State::Stopped(Stop::Parked);
                     if !self.watchpoints.is_empty() {
@@ -2041,28 +2534,72 @@ impl Drop for Session {
 /// Keep the redirection short enough for the original pathname buffer,
 /// regardless of TMPDIR (Nix shells commonly use a much longer directory).
 /// mkstemp creates an exclusively owned file; checkpoints share its lifetime.
-pub struct CpuOnline(String);
+/// Files whose kernel-provided contents are live state that a program
+/// parses: the tracee gets a canonical copy instead (the path in its
+/// `open` is rewritten to a file the tracer created).  The cpu lists make
+/// the program see one cpu.  The mount table and cgroup membership change
+/// their mount ids and names from run to run (HotSpot parses
+/// `/proc/self/mountinfo` at startup to find cgroup limits, and the number
+/// of digits changes its branch count), so a canonical table with no
+/// cgroup controllers is served; `/proc/stat` and `/proc/meminfo` are
+/// counters that change every millisecond.
+pub fn canonical_file(path: &str) -> Option<&'static str> {
+    Some(match path {
+        "/sys/devices/system/cpu/online" | "/sys/devices/system/cpu/possible" | "/sys/devices/system/cpu/present" => "0\n",
+        "/proc/self/mountinfo" | "/proc/thread-self/mountinfo" => {
+            "1 0 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
+        }
+        "/proc/self/mounts" | "/proc/mounts" | "/proc/thread-self/mounts" => {
+            "rootfs / rootfs rw 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\n"
+        }
+        "/proc/self/cgroup" | "/proc/thread-self/cgroup" => "0::/\n",
+        "/proc/cgroups" => "#subsys_name\thierarchy\tnum_cgroups\tenabled\n",
+        "/proc/stat" => {
+            "cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 1700000000\nprocesses 1\nprocs_running 1\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n"
+        }
+        "/proc/meminfo" => {
+            "MemTotal:       16777216 kB\nMemFree:         8388608 kB\nMemAvailable:   12582912 kB\nBuffers:               0 kB\nCached:          4194304 kB\nSwapCached:            0 kB\nActive:          4194304 kB\nInactive:        2097152 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nDirty:                 0 kB\nShmem:                 0 kB\nCommitLimit:     8388608 kB\nCommitted_AS:    4194304 kB\nHugepagesize:       2048 kB\n"
+        }
+        _ => return None,
+    })
+}
+
+/// The tracer's canonical files (see `canonical_file`), one per content.
+pub struct CpuOnline(std::cell::RefCell<BTreeMap<&'static str, String>>);
 
 impl CpuOnline {
     fn new() -> Result<Self> {
+        Ok(Self(std::cell::RefCell::new(BTreeMap::new())))
+    }
+
+    /// Path of a file holding `content`, created on first use.
+    fn path_for(&self, content: &'static str) -> Result<String> {
         use std::io::Write;
         use std::os::fd::FromRawFd;
-        let mut path = b"/tmp/ffs-cpu-XXXXXX\0".to_vec();
+        if let Some(p) = self.0.borrow().get(content) {
+            return Ok(p.clone());
+        }
+        let mut path = b"/tmp/ffs-file-XXXXXX\0".to_vec();
         let fd = unsafe { libc::mkostemp(path.as_mut_ptr().cast(), libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
         path.pop();
-        let result = Self(String::from_utf8(path)?);
+        let p = String::from_utf8(path)?;
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        file.write_all(b"0\n")?;
-        Ok(result)
+        file.write_all(content.as_bytes())?;
+        // Readable by the tracee, which runs as "nobody" in its user namespace.
+        let _ = std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o644));
+        self.0.borrow_mut().insert(content, p.clone());
+        Ok(p)
     }
 }
 
 impl Drop for CpuOnline {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        for p in self.0.borrow().values() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 

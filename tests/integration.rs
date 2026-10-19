@@ -765,3 +765,27 @@ fn process_tree_agrees_with_the_kernel() {
         assert!(text.contains("explored 20 branches, 0 failing"), "{name}: {text}");
     }
 }
+
+/// io_uring runs as a synchronous facade: every `io_uring_enter` waits for
+/// what it submitted, so the completion queue is deterministic and the
+/// program records, replays and explores like any other.
+#[test]
+fn io_uring_is_a_synchronous_facade() {
+    build_tests();
+    if !pmu_ok() {
+        return;
+    }
+    let native = Command::new(prog("uring_read")).output().expect("run uring_read");
+    if native.status.code() == Some(2) {
+        eprintln!("io_uring not available here; skipping");
+        return;
+    }
+    let out_dir = tmpdir("uring");
+    let (out, text) = run(ffs()
+        .args(["explore", "--iterations", "10", "--keep-going", "--output-dir"])
+        .arg(&out_dir)
+        .arg("--")
+        .arg(prog("uring_read")));
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("explored 10 branches, 0 failing"), "{text}");
+}

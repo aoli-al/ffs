@@ -172,6 +172,11 @@ struct PolicyOpts {
     /// otherwise found rarely.  0 disables it.
     #[arg(long, default_value_t = 0.3)]
     wake_delay: f64,
+    /// Probability that the random policy picks among the threads not
+    /// detected as spinning when some are (a spinner waits for someone
+    /// else; running it again rarely makes progress).
+    #[arg(long, default_value_t = 0.0)]
+    spin_avoid: f64,
     /// Maximum ticks a thread may run while others are runnable (0 =
     /// unlimited).  100k ticks cost about as much as the scheduling step
     /// itself, and bound what a busy-waiting thread burns per slice (a
@@ -577,6 +582,7 @@ impl From<PolicyOpts> for sched::PolicyParams {
             watch_count: p.watch_count,
             watch_hold: p.watch_hold,
             wake_delay: p.wake_delay,
+            spin_avoid: p.spin_avoid,
         }
     }
 }

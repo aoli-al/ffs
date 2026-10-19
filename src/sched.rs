@@ -88,12 +88,9 @@ pub struct SpinTracker {
 
 /// Same-page preemptions before a thread counts as spinning.
 const SPIN_STREAK: u32 = 2;
-/// Smallest slice a spinner is given (ticks): about the cost of the
-/// scheduling step itself, so a spinner burns no more than that per turn.
-pub const SPIN_MIN_SLICE: u64 = 2 * 1024;
-/// Probability that the random policy chooses among the non-spinning
-/// threads when there are any.
-const SPIN_AVOID: f64 = 0.85;
+/// Smallest slice a spinner is given (ticks).
+pub const SPIN_MIN_SLICE: u64 = 16 * 1024;
+
 
 impl SpinTracker {
     pub fn observe(&mut self, step: &Step, watch_preempt: bool) {
@@ -265,6 +262,7 @@ pub struct Random {
     hold: WatchHold,
     pub wake_delay: f64,
     wake: WakeDelay,
+    pub spin_avoid: f64,
 }
 
 impl Random {
@@ -287,6 +285,7 @@ impl Random {
             hold: WatchHold::default(),
             wake_delay: 0.0,
             wake: WakeDelay::default(),
+            spin_avoid: 0.0,
         }
     }
 }
@@ -307,7 +306,7 @@ impl Policy for Random {
         // choice is made among the others (it still gets its turn, which
         // a lock holder spinning on a second lock needs).
         let non_spinners: Vec<Ltid> = enabled.iter().copied().filter(|l| !ctx.spinning.contains(l)).collect();
-        let enabled = if !non_spinners.is_empty() && non_spinners.len() < enabled.len() && self.rng.gen_bool(SPIN_AVOID) {
+        let enabled = if !non_spinners.is_empty() && non_spinners.len() < enabled.len() && self.spin_avoid > 0.0 && self.rng.gen_bool(self.spin_avoid) {
             non_spinners
         } else {
             enabled
@@ -949,6 +948,9 @@ pub struct PolicyParams {
     pub watch_hold: f64,
     /// Probability of delaying a just-woken thread (see `WakeDelay`).
     pub wake_delay: f64,
+    /// Probability that the random policy chooses among the non-spinning
+    /// threads when there are any.
+    pub spin_avoid: f64,
 }
 
 /// Events a thread held back after a watchpoint hit stays unscheduled.
@@ -1041,19 +1043,24 @@ pub fn make_branch_policy(p: &PolicyParams, seed: u64, expected_steps: usize, br
         }
         n => n,
     };
+    // The wake delay helps wakeup-latency races and hurts others (a long
+    // computation that must stay ahead of a thread it just woke), so like
+    // the policy it alternates: branches 0,1 of every four use it.
+    let wake_delay = if (branch >> 1).is_multiple_of(2) { p.wake_delay } else { 0.0 };
     Ok(match name {
         "fifo" => Box::new(Fifo::new(p.max_slice)),
         "rr" | "round-robin" => Box::new(RoundRobin { max_slice: p.max_slice }),
         "random" => {
             let mut r = Random::new(seed, p.preempt_prob, p.max_budget, p.switch_prob, p.max_slice, p.max_steps);
             r.watch_hold = p.watch_hold;
-            r.wake_delay = p.wake_delay;
+            r.wake_delay = wake_delay;
+            r.spin_avoid = p.spin_avoid;
             Box::new(r)
         }
         "pct" => {
             let mut r = Pct::new(seed, p.pct_depth, expected_steps, p.preempt_prob, p.max_budget, p.max_slice, p.max_steps);
             r.watch_hold = p.watch_hold;
-            r.wake_delay = p.wake_delay;
+            r.wake_delay = wake_delay;
             Box::new(r)
         }
         other => bail!("unknown policy {other}"),

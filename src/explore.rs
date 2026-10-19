@@ -138,7 +138,7 @@ fn run_branch(
         if ropts.verbose {
             eprintln!("[ffs]       enabled={enabled:?} blocked={blocked:?} woken={woken:?} spinning={spinning:?}");
         }
-        let mut decision = policy.decide(&SchedContext {
+        let decision = policy.decide(&SchedContext {
             current,
             last_event: steps.last().map(|s| &s.event),
             enabled: &enabled,
@@ -151,17 +151,6 @@ fn run_branch(
         })?;
         if let Decision::Stop(o) = decision {
             return Ok(o);
-        }
-        if let Decision::Run { ltid, budget, steps: insn } = &mut decision {
-            // Only a detected spinner's slices are shrunk (a general
-            // shrink would multiply the steps of every long loop and put
-            // PCT's change points inside them); it costs the spinner's
-            // turn about one scheduling step instead of a whole slice.
-            let capped = if enabled.len() > 1 { spin.cap(*ltid, *budget) } else { *budget };
-            if capped != *budget {
-                *budget = capped;
-                *insn = 0;
-            }
         }
         let mut step = perform(session, &decision)?;
         step.vt = vt_before;
@@ -198,9 +187,16 @@ fn run_branch(
     }
 }
 
+/// Share of the per-branch watchpoint sample drawn from slots already
+/// seen contended (the rest is random).
+const CONTENDED_SHARE: f64 = 0.7;
+
 struct Explorer {
     /// `--exact-preempt`: preemptions whose early stop overshot the target.
     overshoots: u64,
+    /// Watched slots that two or more threads touched in one branch, with
+    /// the number of such branches: later branches sample these first.
+    contended: std::collections::BTreeMap<u64, u32>,
     argv: Vec<String>,
     pmu: PmuConfig,
     ropts: RunOpts,
@@ -265,6 +261,11 @@ impl Explorer {
         let ok = match (&outcome, expected) {
             (Outcome::Bound, _) if pol.idx == steps.len() => true,
             (Outcome::Divergence { .. }, _) => false,
+            // A deadlock is the same deadlock when the same threads are
+            // stuck; how many periodic timer wakeups the detector counted
+            // before declaring it, and at what virtual time, depend on
+            // when the detector's real-time grace ran out.
+            (Outcome::Deadlock { blocked: a, .. }, Outcome::Deadlock { blocked: b, .. }) => a == b || pol.finished(),
             (a, b) => a == b || pol.finished(),
         };
         if !ok {
@@ -318,7 +319,29 @@ impl Explorer {
                 self.globals.iter().map(|g| (g.addr & !7, g.size.div_ceil(8).max(1), g.name.as_str())).collect();
             let n = (self.params.watch_count as usize).min(4).min(cands.len());
             let mut names = Vec::new();
+            // Slots that earlier branches saw two threads touch are where
+            // the races are; most of the sample comes from them, weighted
+            // by how often, the rest stays random so that new ones turn up.
+            let total: u32 = self.contended.values().sum();
             for i in 0..n {
+                if total > 0 && self.rng.gen_bool(CONTENDED_SHARE) {
+                    let mut r = self.rng.gen_range(0..total);
+                    let pick = self.contended.iter().find(|(_, c)| {
+                        if r < **c {
+                            true
+                        } else {
+                            r -= **c;
+                            false
+                        }
+                    });
+                    if let Some((a, _)) = pick {
+                        if !addrs.contains(a) {
+                            addrs.push(*a);
+                            names.push(format!("{}*", self.global_name(*a)));
+                            continue;
+                        }
+                    }
+                }
                 let j = self.rng.gen_range(i..cands.len());
                 cands.swap(i, j);
                 let (base, nslots, name) = cands[i];
@@ -336,6 +359,15 @@ impl Explorer {
         session.watch_hits = [0; 4];
         session.watch_disabled = 0;
         session.apply_watchpoints()
+    }
+
+    /// The global (with offset) an address falls in, for messages.
+    fn global_name(&self, a: u64) -> String {
+        match self.globals.iter().find(|g| a >= g.addr && a < g.addr + g.size.max(8)) {
+            Some(g) if a == g.addr => g.name.clone(),
+            Some(g) => format!("{}+{}", g.name, a - g.addr),
+            None => format!("{a:#x}"),
+        }
     }
 
     /// A fresh policy for one branch (random or PCT, with its own seed).
@@ -364,6 +396,11 @@ impl Explorer {
                 &mut steps,
             )?;
             self.overshoots += session.exact_overshoots;
+            for (i, a) in session.watchpoints.iter().enumerate() {
+                if session.watch_threads[i].len() >= 2 {
+                    *self.contended.entry(*a).or_insert(0) += 1;
+                }
+            }
             let ports = session.ports_used.clone();
             session.kill_all();
             session.restore_files();
@@ -796,6 +833,7 @@ pub fn explore(
 
     let mut ex = Explorer {
         overshoots: 0,
+        contended: std::collections::BTreeMap::new(),
         argv,
         pmu,
         ropts,
@@ -834,6 +872,12 @@ pub fn explore(
         "[ffs] explored {} branches, {} failing",
         ex.branches, ex.failures
     );
+    if !ex.contended.is_empty() {
+        let mut v: Vec<(&u64, &u32)> = ex.contended.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        let shown: Vec<String> = v.iter().take(6).map(|(a, c)| format!("{} ({c})", ex.global_name(**a))).collect();
+        eprintln!("[ffs] globals touched by two or more threads in a branch (sampled first): {}", shown.join(", "));
+    }
     if ex.overshoots > 0 {
         eprintln!(
             "[ffs] --exact-preempt: {} preemptions overshot the early stop (interrupt skid beyond the margin); those are not reproducible",

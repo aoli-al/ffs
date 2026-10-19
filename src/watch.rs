@@ -170,11 +170,17 @@ pub fn resolve(globals: &[Global], item: &str) -> Result<u64> {
 impl Session {
     /// Account a hit on the slots in `bits`; slots that reached the cap are
     /// disabled on every thread.
-    pub fn watch_account(&mut self, bits: u8) -> Result<()> {
+    pub fn watch_account(&mut self, tid: pid_t, bits: u8) -> Result<()> {
         let mut changed = false;
+        let ltid = self.tasks.get(&tid).map(|t| t.ltid);
         for i in 0..4 {
             if bits & (1 << i) != 0 && i < self.watchpoints.len() {
                 self.watch_hits[i] += 1;
+                if let Some(l) = ltid {
+                    if !self.watch_threads[i].contains(&l) {
+                        self.watch_threads[i].push(l);
+                    }
+                }
                 if self.watch_hits[i] == MAX_HITS_PER_SLOT {
                     log::debug!("watchpoint {:#x} hit {} times; disabling it", self.watchpoints[i], MAX_HITS_PER_SLOT);
                     changed = true;

@@ -12,3 +12,11 @@
 /tests/crates/results
 /tests/crates/*.log
 /tests/liquid-cache/out
+/tests/cprog/results
+/tests/cprog/*.log
+/tests/rr/out-now
+/tests/queue.log
+/tests/queue2.log
+/tests/crates/results-*.log
+/tests/datafusion/harness/build.log
+/tests/rr/run-now.log

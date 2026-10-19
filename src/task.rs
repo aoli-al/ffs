@@ -51,13 +51,21 @@ pub enum State {
 /// can only be woken by another tracee (all stopped) or a virtual timer, so
 /// seeing it asleep means it is blocked, deterministically.  An `External`
 /// syscall (sockets whose peer is not a tracee, devices) may complete on
-/// its own after a short sleep, so it gets a real-time grace.  `Never`:
-/// disk I/O and the like, waited for however long it takes.
+/// its own after a short sleep, so it gets a real-time grace
+/// (`--block-grace-us`).  `Never`: disk I/O and the like, waited for
+/// however long it takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum BlockClass {
     #[default]
     Never,
+    /// A wait only another tracee or a virtual timer can end (futex,
+    /// wait4, pause...): blocked the moment it sleeps.
     Tracee,
+    /// A wait on a descriptor fed by tracees (poll, epoll, a pipe or a
+    /// socket pair): the same, except that the kernel may still be
+    /// delivering what a tracee sent moments ago (loopback traffic lands
+    /// from softirq context), so a short fixed grace is kept.
+    Fd,
     External,
 }
 

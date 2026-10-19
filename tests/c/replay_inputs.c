@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
         return result <= 0;
     }
     if (!strcmp(argv[1], "async")) {
-        const long calls[] = {206, 209, 298, 323, 425, 426, 427};
+        const long calls[] = {206, 209, 298, 323};
         for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); ++i) {
             errno = 0;
             assert(syscall(calls[i], 0, 0, 0, 0, 0, 0) == -1);

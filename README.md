@@ -143,6 +143,32 @@ priority change point. liquid-cache's double-accounting race (two readers
 hydrating the same entry) is found in 3 of 4 schedules with a watchpoint
 on the counter and `--watch-hold 0.7`, and in none of 1600 without.
 
+Watchpoint sampling is contention-directed: a slot that two or more
+threads touched in a branch is remembered with a score, and 70% of the
+next branches' sample is drawn from those slots (weighted), the rest stays
+random so that new ones turn up. The summary names the contended globals.
+
+### Scheduling policies and the wakeup window
+
+Natively a thread woken by another needs tens of microseconds to get a
+CPU, during which the waker keeps running; a serializing scheduler that
+can run the woken thread at once rarely explores that window. tokio's
+blocking-pool shutdown race (#7922) fails natively every time and under
+`random` in one schedule of seven. `--wake-delay P` (default 0.3) keeps a
+just-woken thread off the runnable set with probability P for a
+log-uniform number of events (up to 64): on that race it raises the rate
+from 16% to 31% of schedules (47% at 0.6). It halves the detection of the
+opposite shape (a long computation that must stay ahead of a thread it
+woke), so like the policy it alternates: of every four branches, two use
+the delay and two do not.
+
+`--spin-avoid P` (default 0) makes the random policy choose among the
+threads not detected as spinning with probability P; a spinner waits for
+someone else, so running it again rarely makes progress. It is off by
+default because spin detection (consecutive preemptions in one code page)
+also fires on long computations, and starving those loses bugs such as
+`order_violation`.
+
 ### Deadlocks and hangs
 
 A program is deadlocked when no thread can run and no virtual deadline is
@@ -366,25 +392,56 @@ mountinfo parser differed with the number of digits in a mount id.
 
 ### Remaining nondeterminism
 
-The seed does not determine host-timed slice preemptions, hardware overflow
-interrupt skid, external signals, or kernel readiness and wake ordering.
-Synchronous regular-file I/O and known synchronous queries no longer become
-`Blocked` scheduling events merely because the disk or host is slow.
-`--slice-cap-ms 0` disables wall-clock slice preemption, but branchless loops
-may then run forever; this alone does not make same-seed runs deterministic.
+Three things used to make an exploration with the same seed differ from
+one run to the next, and two of them are gone:
+
+* **Whether a sleeping thread counts as blocked** was decided by one
+  100 µs real-time grace for every syscall, so a loaded machine (disk
+  latency, a slow socket) reclassified threads. Now syscalls are classed:
+  regular-file I/O is always waited for; a wait that only another tracee
+  or a virtual timer can end (futex, poll and epoll, pipes, socket pairs,
+  wait4, pause, accept...) keeps a fixed 100 µs grace, which only has to
+  cover kernel work already queued (a zero grace recorded steps that did
+  not replay: even a futex wait is seen asleep for a moment on its way to
+  completing); external I/O (a socket whose peer is not a tracee, a
+  device) gets `--block-grace-us`, now 1 ms.
+* **Whether a woken thread's stop had arrived** by the next decision
+  depended on kernel scheduling latency. After any step that can wake a
+  thread (a futex wake, a write to a pipe, a signal, an exit) the stops in
+  flight are waited for before the enabled set is read.
+* **Where a tick budget expires** varies with the counter interrupt's
+  skid: the same branch count, a different instruction in the following
+  block, and under load a different count altogether. `--exact-preempt`
+  arms the counter 512 ticks early and block-steps (one stop per taken
+  branch, `PTRACE_SINGLEBLOCK`, with syscall instructions scanned for and
+  single-stepped) to the exact count; a same-seed exploration then repeats
+  exactly unless the skid exceeds the margin, which the summary reports as
+  overshoots. It costs 4-13x in wall time, so it is opt-in: use it to
+  re-find a rare failure with its seed, or replay the saved schedule, which
+  is always exact.
+
+The seed still does not determine host-timed slice preemptions
+(`--slice-cap-ms 0` disables them, but branchless loops may then run
+forever), external signals, or external I/O readiness.
 
 Network and terminal input, external pipes, many ioctls, kernel-generated
 object ids and file-backed mappings still depend on live state. Successful
 replay means the recorded checks passed, not that every byte of process or
 kernel state was identical.
 
-Asynchronous-memory interfaces (`io_setup`, `io_submit`, `io_uring_*`,
-`userfaultfd`, `perf_event_open`) return `ENOSYS` under
-ffs. Libraries usually have a fallback (liquid-cache's `t4` store has a
-thread-pool backend behind a cargo feature) but the fallback is what gets
-tested, not the io_uring path.
-Inherited asynchronous resources and direct hardware randomness are not
-covered by these syscall guards.
+Asynchronous-memory interfaces (`io_setup`, `io_submit`, `userfaultfd`,
+`perf_event_open`) return `ENOSYS` under ffs. io_uring runs as a
+*synchronous facade*: every `io_uring_enter` waits for what it submitted
+(`min_complete` raised to `to_submit`, `IORING_ENTER_GETEVENTS` set) and
+SQPOLL is cleared at setup, so when `enter` returns the completion queue
+holds the results, like a batch of synchronous syscalls, and the schedule
+does not depend on the kernel's worker timing. tokio's nine io_uring tests
+pass this way. The difference from native behaviour: an operation meant to
+stay pending (a multishot accept, a timeout) blocks the submitter until it
+fires. A live ring cannot be checkpointed (its state is in the kernel);
+the checkpoint fails with a message, so take the root before the ring is
+set up or explore from the start. Inherited asynchronous resources and
+direct hardware randomness are not covered by these syscall guards.
 
 ## How it works
 

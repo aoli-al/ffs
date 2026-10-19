@@ -51,9 +51,10 @@ pub struct Effects {
 }
 
 pub fn refused_syscall(nr: u64) -> bool {
-    // aio setup/submit, perf events, userfaultfd,
-    // io_uring setup/enter/register. Also reject inherited ring use.
-    matches!(nr, 206 | 209 | 298 | 323 | 425 | 426 | 427)
+    // aio setup/submit, perf events, userfaultfd: these complete work
+    // outside traced syscall boundaries.  io_uring is run synchronously
+    // instead (see `Session::uring_pre_syscall`).
+    matches!(nr, 206 | 209 | 298 | 323)
 }
 
 pub fn metadata_query(nr: u64) -> bool {
@@ -202,12 +203,16 @@ pub fn block_class(t: &mut Task, nr: u64, peers: &std::collections::BTreeMap<u64
     {
         return Ok(BlockClass::Never);
     }
-    // Waits that only another tracee or a (virtual) timer can end.
-    if matches!(
-        nr,
-        7 | 23 | 34 | 43 | 61 | 65 | 70 | 73 | 128 | 130 | 202 | 220 | 232 | 242 | 243 | 247 | 270 | 271 | 281 | 288 | 441 | 449
-    ) {
+    // Waits that only another tracee or a (virtual) timer can end: futex,
+    // futex_waitv, pause, rt_sigsuspend, rt_sigtimedwait, wait4, waitid,
+    // semop, semtimedop, msgrcv, flock, mq_timedsend/receive.
+    if matches!(nr, 34 | 61 | 65 | 70 | 73 | 128 | 130 | 202 | 220 | 242 | 243 | 247 | 449) {
         return Ok(BlockClass::Tracee);
+    }
+    // Descriptor waits: poll, select, accept, pselect6, ppoll, epoll_wait,
+    // epoll_pwait, accept4, epoll_pwait2.
+    if matches!(nr, 7 | 23 | 43 | 270 | 271 | 232 | 281 | 288 | 441) {
+        return Ok(BlockClass::Fd);
     }
     if READ_LIKE.contains(&nr) || WRITE_LIKE.contains(&nr) {
         let fd = t.regs()?.rdi;
@@ -217,10 +222,10 @@ pub fn block_class(t: &mut Task, nr: u64, peers: &std::collections::BTreeMap<u64
         if l.starts_with("pipe:") || l.starts_with("anon_inode:[eventfd]") || l.starts_with("anon_inode:[timerfd]")
             || l.starts_with("anon_inode:[signalfd]")
         {
-            return Ok(BlockClass::Tracee);
+            return Ok(BlockClass::Fd);
         }
         if let Some(ino) = l.strip_prefix("socket:[").and_then(|r| r.strip_suffix(']')).and_then(|n| n.parse::<u64>().ok()) {
-            return Ok(if peers.contains_key(&ino) { BlockClass::Tracee } else { BlockClass::External });
+            return Ok(if peers.contains_key(&ino) { BlockClass::Fd } else { BlockClass::External });
         }
         if std::fs::metadata(format!("/proc/{}/fd/{fd}", t.tid)).map(|m| m.is_file()).unwrap_or(false) {
             return Ok(BlockClass::Never);

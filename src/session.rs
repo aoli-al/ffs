@@ -211,6 +211,8 @@ pub struct Session {
     /// Hits per watchpoint slot in this execution, and slots disabled
     /// because they were hit too often.
     pub watch_hits: [u32; 4],
+    /// Threads that hit each slot in this branch (contention evidence).
+    pub watch_threads: [Vec<Ltid>; 4],
     pub watch_disabled: u8,
     /// Files to put back when this execution is over (see `files.rs`).
     pub file_snapshots: BTreeMap<std::path::PathBuf, crate::files::Snapshot>,
@@ -324,6 +326,11 @@ pub struct DeadlockInfo {
     pub wakes: u64,
 }
 
+/// Grace for a wait that only tracees or virtual timers can end
+/// (`BlockClass::Tracee`, `Fd`): a fixed value, since what remains to land
+/// is kernel work already queued (a softirq, an exit's futex wake), not
+/// disk or network latency.
+const FD_GRACE: Duration = Duration::from_micros(100);
 /// Ticks the counter is armed early in `run_task_exact`.
 const EXACT_MARGIN: u64 = 512;
 /// Bytes of code scanned ahead for a syscall instruction before a block step.
@@ -588,6 +595,7 @@ impl Session {
             watch_requests: Vec::new(),
             watch_pending: Default::default(),
             watch_hits: [0; 4],
+            watch_threads: Default::default(),
             watch_disabled: 0,
             file_snapshots: BTreeMap::new(),
             watch_preempt: false,
@@ -832,10 +840,16 @@ impl Session {
             // may complete by itself after a short sleep and keeps the grace.
             let grace = if self.replay {
                 self.opts.deadlock_timeout
-            } else if self.task(tid)?.block_class == crate::task::BlockClass::Tracee {
-                Duration::ZERO
             } else {
-                self.opts.block_grace
+                // Even a futex wait is seen asleep for a moment on its way
+                // to completing (a wake already in flight from a thread
+                // exit, a requeue): recordings classified at zero grace
+                // did not replay.  Tracee waits keep a short fixed grace;
+                // only external I/O depends on `--block-grace-us`.
+                match self.task(tid)?.block_class {
+                    crate::task::BlockClass::Tracee | crate::task::BlockClass::Fd => FD_GRACE,
+                    _ => self.opts.block_grace,
+                }
             };
             let timeout = if allow_block {
                 let since = *sleeping_since.get_or_insert_with(Instant::now);
@@ -1056,7 +1070,9 @@ impl Session {
     /// step that can wake someone (see `may_wake`) the stops in flight are
     /// waited for, bounded, before the enabled set is read.
     pub fn wait_wakes(&mut self) -> Result<()> {
-        if !std::mem::take(&mut self.wake_pending) {
+        // A replay knows from the trace which thread runs next and waits
+        // for that (`wait_for_completion`); this is for exploration.
+        if !std::mem::take(&mut self.wake_pending) || self.replay {
             return Ok(());
         }
         let start = Instant::now();
@@ -1505,7 +1521,7 @@ impl Session {
                             t.pending_sig = 0;
                             t.state = State::Stopped(Stop::Parked);
                             self.watch_preempt = true;
-                            self.watch_account(bits)?;
+                            self.watch_account(tid, bits)?;
                             return Ok(if self.replay { None } else { Some(Event::Preempt) });
                         }
                     }
@@ -1710,6 +1726,57 @@ impl Session {
         Ok(())
     }
 
+    /// io_uring as a synchronous facade.  A ring completes work outside
+    /// any traced syscall (io-wq workers, or an SQPOLL kernel thread), and
+    /// the program reads the completions from shared memory, so the
+    /// schedule would depend on kernel timing.  Instead every
+    /// `io_uring_enter` waits for everything it submits (`min_complete`
+    /// raised to `to_submit`, `IORING_ENTER_GETEVENTS` set): when it
+    /// returns, the completion queue holds the results of all submitted
+    /// operations, like a batch of synchronous syscalls.  SQPOLL is turned
+    /// off at setup.  Operations that complete only through another
+    /// tracee's action block the submitter like a blocking read would; an
+    /// operation meant to stay pending (a multishot accept, a timeout)
+    /// blocks it until it fires, which is where this facade differs from
+    /// the native behaviour.
+    fn uring_pre_syscall(&mut self, tid: pid_t, nr: u64) -> Result<()> {
+        const IO_URING_SETUP: u64 = 425;
+        const IO_URING_ENTER: u64 = 426;
+        const IORING_SETUP_SQPOLL: u32 = 1 << 1;
+        const IORING_ENTER_GETEVENTS: u64 = 1;
+        match nr {
+            IO_URING_SETUP => {
+                let t = self.task_mut(tid)?;
+                let r = t.regs()?;
+                if r.rsi != 0 {
+                    let mut flags = [0u8; 4];
+                    if t.mem.read(r.rsi + 8, &mut flags).is_ok() {
+                        let f = u32::from_ne_bytes(flags);
+                        if f & IORING_SETUP_SQPOLL != 0 {
+                            log::info!("T{}: io_uring_setup without SQPOLL", t.ltid);
+                            t.mem.write(r.rsi + 8, &(f & !IORING_SETUP_SQPOLL).to_ne_bytes())?;
+                        }
+                    }
+                }
+            }
+            IO_URING_ENTER => {
+                let t = self.task_mut(tid)?;
+                let r = t.regs()?;
+                let mut n = r;
+                n.rdx = n.rdx.max(n.rsi);
+                n.r10 |= IORING_ENTER_GETEVENTS;
+                if n.rdx != r.rdx || n.r10 != r.r10 {
+                    t.set_regs(&n)?;
+                    if t.entry_regs.is_none() {
+                        t.entry_regs = Some(r);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn pre_syscall(&mut self, _tid: pid_t, nr: u64) -> Result<()> {
         // These interfaces permit writes outside traced syscall boundaries.
         // Refuse setup/submission before they can create asynchronous state.
@@ -1728,6 +1795,7 @@ impl Session {
                 ns.steer_canonical(self.next_ltid)?;
             }
         }
+        self.uring_pre_syscall(_tid, nr)?;
         self.file_pre_syscall(_tid, nr)?;
         self.proc_pre_syscall(_tid, nr)?;
         self.sigmask_pre_syscall(_tid, nr)?;
@@ -2496,7 +2564,7 @@ impl Session {
                     if !self.watchpoints.is_empty() {
                         let bits = crate::watch::watchpoint_hits(tid);
                         if bits != 0 {
-                            self.watch_account(bits)?;
+                            self.watch_account(tid, bits)?;
                             self.watch_preempt = true;
                             break;
                         }
@@ -2556,7 +2624,7 @@ impl Session {
                         if bits != 0 {
                             // The stepped instruction touched a watched
                             // variable: that is the scheduling point.
-                            self.watch_account(bits)?;
+                            self.watch_account(tid, bits)?;
                             self.watch_preempt = true;
                             break;
                         }

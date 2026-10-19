@@ -571,6 +571,10 @@ fn privatize_fds(leader: &mut Task, ctx: &mut ShareCtx) -> Result<()> {
 fn privatize_shared_maps(leader: &mut Task, ctx: &mut ShareCtx) -> Result<()> {
     let pid = leader.tid;
     let maps = read_maps(pid)?;
+    if let Some(m) = maps.iter().find(|m| m.path.contains("io_uring")) {
+        // The ring's state lives in the kernel; a copy cannot be forked.
+        bail!("a live io_uring ring ({:#x}-{:#x}) cannot be checkpointed; take the checkpoint before the ring is set up or after it is closed", m.start, m.end);
+    }
     let todo: Vec<_> = maps
         .into_iter()
         .filter(|m| m.is_shared() && m.is_writable())
@@ -832,6 +836,7 @@ impl Session {
             watch_requests: self.watch_requests.clone(),
             watch_pending: Default::default(),
             watch_hits: [0; 4],
+            watch_threads: Default::default(),
             watch_disabled: 0,
             file_snapshots: self.file_snapshots.clone(),
             watch_preempt: false,

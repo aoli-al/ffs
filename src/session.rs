@@ -65,6 +65,11 @@ pub enum Event {
     Begin,
     End,
     Yield,
+    /// `ffs_point()`: a scheduling point without a hint that the thread
+    /// waits. Random policies may switch here as at any event; PCT keeps
+    /// its priorities (a yield demotes the thread, which is wrong for a
+    /// point inside a critical section that spinners wait for).
+    Point,
     AssertFailed {
         msg: String,
     },
@@ -1915,6 +1920,7 @@ impl Session {
                 }
             }
             MagicCall::Yield => Event::Yield,
+            MagicCall::Point => Event::Point,
             MagicCall::Log => {
                 let msg = t.mem.read_cstr(r.rdi, 4096).unwrap_or_default();
                 let ltid = t.ltid;

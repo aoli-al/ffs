@@ -29,22 +29,24 @@
 //!   race (`ffs_watch`), so that every access to it is a scheduling point;
 //! - `FFS_BBTREE_SEED`: the model threads' operations (the same in every
 //!   branch; the schedule is what varies);
-//! - `FFS_BBTREE_OPS`: how many operations each model thread runs.
+//! - `FFS_BBTREE_OPS`: how many operations each model thread runs;
+//! - `FFS_BBTREE_THREADS`: how many threads share the keys of a
+//!   linearizability scenario.
 
 use core::alloc::Layout;
 use core::fmt;
 use core::mem;
 use core::ops::{Bound, ControlFlow, RangeBounds};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::collections::{BTreeMap, BTreeSet};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::format;
 use std::string::{String, ToString};
 use std::thread;
 use std::vec::Vec;
 
 use crate::allocator::{AllocError, Allocator, Global};
-use crate::inline_key::Auto;
+use crate::inline_key::{Auto, InlineKeyStrategy, WithInlineKey};
 use crate::map::BBTreeMap;
 
 /// The tracee side of ffs: raw syscalls with numbers Linux does not know,
@@ -77,9 +79,12 @@ mod ffs {
         unsafe { raw(BASE + 1, name.as_ptr() as i64, 0) };
     }
 
-    /// A scheduling point.
-    pub fn yield_now() {
-        unsafe { raw(BASE + 3, 0, 0) };
+    /// A scheduling point: a random policy may switch here, PCT keeps its
+    /// priorities (not a yield, which would say the thread waits and
+    /// demote it: the point is inside the map's closures, under a latch
+    /// other threads spin for).
+    pub fn point() {
+        unsafe { raw(BASE + 9, 0, 0) };
     }
 
     /// A line in the tracer's log, prefixed with the thread.
@@ -101,6 +106,7 @@ struct Settings {
     watch_last: bool,
     seed: u64,
     operations: Option<usize>,
+    threads: Option<usize>,
 }
 
 impl Settings {
@@ -117,17 +123,122 @@ impl Settings {
             operations: std::env::var("FFS_BBTREE_OPS")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            threads: std::env::var("FFS_BBTREE_THREADS")
+                .ok()
+                .and_then(|s| s.parse().ok()),
         }
     }
 }
 
 /// The global allocator, remembering the first page it handed out (the
 /// root's, which the tree keeps for its whole life) and the last one: the
-/// pages whose latch words a test may watch.
+/// pages whose latch words a test may watch; and every page still out, so
+/// that a page freed twice, or one that is not its own, is caught, a page
+/// given back while threads share the map (the map must keep its pages
+/// type-stable until its owner drops it: `doc/09-concurrency.md`,
+/// Type-stable nodes), and a page never given back. A thread sharing the
+/// map may give back a page it allocated itself and never published (the
+/// root page of a tree another thread started first).
+///
+/// Lock-free, so that the harness adds no wait of its own to the map's
+/// allocations (a lock here would be a futex inside a split).
 struct Pages {
     root: AtomicUsize,
     last: AtomicUsize,
     count: AtomicUsize,
+    live: PageTable,
+    /// The test's thread once the race began (a [`thread_number`]): the
+    /// only one that may give a page back, as the map's owner, besides a
+    /// page's own allocator. 0 before the race.
+    owner: AtomicU64,
+}
+
+/// A number for each thread, from 1.
+fn thread_number() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    std::thread_local! {
+        static ME: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    ME.with(|me| *me)
+}
+
+/// The pages out, each with the number of the thread that allocated it:
+/// an open-addressed table whose slots are taken by compare-and-swap and
+/// never reused (a removed page leaves a tombstone).
+struct PageTable {
+    addresses: Vec<AtomicUsize>,
+    allocators: Vec<AtomicU64>,
+    live: AtomicUsize,
+}
+
+impl PageTable {
+    const SLOTS: usize = 1 << 15;
+    const TOMBSTONE: usize = usize::MAX;
+
+    fn new() -> Self {
+        Self {
+            addresses: (0..Self::SLOTS).map(|_| AtomicUsize::new(0)).collect(),
+            allocators: (0..Self::SLOTS).map(|_| AtomicU64::new(0)).collect(),
+            live: AtomicUsize::new(0),
+        }
+    }
+
+    fn slot_of(address: usize) -> usize {
+        (address >> 12).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 49
+    }
+
+    /// Records `address` as out; false if it already is.
+    fn insert(&self, address: usize) -> bool {
+        let mut slot = Self::slot_of(address) % Self::SLOTS;
+        for _ in 0..Self::SLOTS {
+            match self.addresses[slot].load(Ordering::Acquire) {
+                0 => {
+                    if self.addresses[slot]
+                        .compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        self.allocators[slot].store(thread_number(), Ordering::Release);
+                        self.live.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
+                    continue; // taken meanwhile: look at the slot again
+                }
+                current if current == address => return false,
+                _ => slot = (slot + 1) % Self::SLOTS,
+            }
+        }
+        panic!("the page table is full");
+    }
+
+    /// Takes `address` out: the number of the thread that allocated it, or
+    /// none if it is not out.
+    fn remove(&self, address: usize) -> Option<u64> {
+        let mut slot = Self::slot_of(address) % Self::SLOTS;
+        for _ in 0..Self::SLOTS {
+            match self.addresses[slot].load(Ordering::Acquire) {
+                0 => return None,
+                current if current == address => {
+                    let allocator = self.allocators[slot].load(Ordering::Acquire);
+                    let taken = self.addresses[slot]
+                        .compare_exchange(address, Self::TOMBSTONE, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok();
+                    if taken {
+                        self.live.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    return taken.then_some(allocator);
+                }
+                _ => slot = (slot + 1) % Self::SLOTS,
+            }
+        }
+        None
+    }
+
+    fn out(&self) -> Vec<usize> {
+        (self.addresses.iter())
+            .map(|a| a.load(Ordering::Relaxed))
+            .filter(|&a| a != 0 && a != Self::TOMBSTONE)
+            .collect()
+    }
 }
 
 impl Pages {
@@ -136,7 +247,14 @@ impl Pages {
             root: AtomicUsize::new(0),
             last: AtomicUsize::new(0),
             count: AtomicUsize::new(0),
+            live: PageTable::new(),
+            owner: AtomicU64::new(0),
         }
+    }
+
+    /// From here on, only the calling thread may give pages back.
+    fn race_begins(&self) {
+        self.owner.store(thread_number(), Ordering::Release);
     }
 
     /// The latch word of the page at `page`: the one of the first two
@@ -197,12 +315,35 @@ unsafe impl Allocator for Pages {
             .compare_exchange(0, address, Ordering::Relaxed, Ordering::Relaxed);
         self.last.store(address, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
+        assert!(self.live.insert(address), "page {address:#x} allocated twice");
         Ok(page)
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        let address = ptr.as_ptr() as usize;
+        let Some(allocated_by) = self.live.remove(address) else {
+            panic!("page {address:#x} given back twice, or never allocated here");
+        };
+        let me = thread_number();
+        let owner = self.owner.load(Ordering::Acquire);
+        if owner != 0 {
+            assert!(
+                me == owner || me == allocated_by,
+                "page {address:#x} given back by a thread sharing the map, which did not allocate it"
+            );
+        }
         // SAFETY: the caller's contract, which is `Global`'s.
         unsafe { Global.deallocate(ptr, layout) }
+    }
+}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        if !thread::panicking() {
+            let out = self.live.out();
+            assert!(out.is_empty(), "{} pages never given back: {out:x?}", out.len());
+            assert_eq!(self.live.live.load(Ordering::Relaxed), 0);
+        }
     }
 }
 
@@ -214,6 +355,7 @@ impl Race {
     fn start(pages: &Pages) {
         let settings = Settings::from_env();
         pages.watch(&settings);
+        pages.race_begins();
         ffs::checkpoint("race");
     }
 }
@@ -229,7 +371,7 @@ struct DropFlags {
 impl DropFlags {
     fn new() -> Self {
         Self {
-            flags: (0..4_096).map(|_| AtomicBool::new(false)).collect(),
+            flags: (0..65_536).map(|_| AtomicBool::new(false)).collect(),
             next: AtomicUsize::new(0),
         }
     }
@@ -241,21 +383,25 @@ impl DropFlags {
         Tracked {
             id,
             slot,
+            origin: slot,
             flags: self,
-            _wide: [Tracked::FILL; 5],
+            _wide: [Tracked::FILL; 4],
         }
     }
 }
 
 /// A map's value: the number of its key, to tell whose entry it is, and its
-/// drop flag in [`DropFlags`]. Wide, so that a leaf holds a dozen, and
-/// filled with words that crash a thread that follows one as a node
-/// pointer.
+/// drop flag in [`DropFlags`]. Wide (8 words, which the shapes the tests
+/// assume follow from), so that a leaf holds a dozen, and filled with
+/// words that crash a thread that follows one as a node pointer.
 struct Tracked<'f> {
     id: u64,
     slot: usize,
+    /// The slot of the value this was cloned from, through any number of
+    /// clones: which entry's value a copy is.
+    origin: usize,
     flags: &'f DropFlags,
-    _wide: [u64; 5],
+    _wide: [u64; 4],
 }
 
 impl Tracked<'_> {
@@ -267,7 +413,7 @@ impl Tracked<'_> {
     /// an entry whose leaf its thread has not latched lets another thread
     /// remove and drop it.
     fn check(&self, id: u64) {
-        ffs::yield_now();
+        ffs::point();
         assert_eq!(self.id, id, "a closure ran on another key's value");
         assert!(
             !self.flags.flags[self.slot].load(Ordering::Relaxed),
@@ -279,6 +425,11 @@ impl Tracked<'_> {
     fn slot(&self) -> usize {
         self.slot
     }
+
+    /// Which entry's value this is, for a clone too.
+    fn origin(&self) -> usize {
+        self.origin
+    }
 }
 
 impl fmt::Debug for Tracked<'_> {
@@ -288,9 +439,28 @@ impl fmt::Debug for Tracked<'_> {
 }
 
 impl Clone for Tracked<'_> {
+    /// Panics if the thread asked for it ([`panic_on_clone`]): a clone runs
+    /// under the entry's latch (`get_cloned`, `range_cloned`), which must
+    /// be let go on the way out.
     fn clone(&self) -> Self {
-        self.flags.value(self.id)
+        PANIC_ON_CLONE.with(|flag| {
+            if flag.get() {
+                panic!("expected panic in user code (clone)");
+            }
+        });
+        let mut clone = self.flags.value(self.id);
+        clone.origin = self.origin;
+        clone
     }
+}
+
+std::thread_local! {
+    static PANIC_ON_CLONE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Makes every `Tracked::clone` on this thread panic, or not.
+fn panic_on_clone(on: bool) {
+    PANIC_ON_CLONE.with(|flag| flag.set(on));
 }
 
 impl Drop for Tracked<'_> {
@@ -304,6 +474,8 @@ impl Drop for Tracked<'_> {
 struct Fixture {
     flags: DropFlags,
     pages: Pages,
+    /// How many `Copy` values were made (`copied_value`).
+    copied: AtomicU64,
 }
 
 impl Fixture {
@@ -311,7 +483,15 @@ impl Fixture {
         Self {
             flags: DropFlags::new(),
             pages: Pages::new(),
+            copied: AtomicU64::new(0),
         }
+    }
+
+    /// A `Copy` value for the key numbered `id`, unlike every other: the
+    /// key's number in its high half, a count in the low one.
+    fn copied_value(&self, id: u64) -> u64 {
+        assert!(id < 1 << 32);
+        (id << 32) | (self.copied.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     fn value(&self, id: u64) -> Tracked<'_> {
@@ -1337,6 +1517,29 @@ impl<'f, K: Ord + Clone + fmt::Debug + Send + Sync> ModelRun<'f, K> {
             .collect();
         assert_eq!(held, expected);
         self.map.check_invariants(held.len());
+        // The owner's walks, which run the unsync tree's code on what the
+        // race left: the same entries, from both ends and taking the tree
+        // apart, every value live.
+        let mut in_key_order: Vec<K> = held.iter().map(|&id| (self.key_of)(id)).collect();
+        in_key_order.sort();
+        let mut iter = self.map.iter_mut();
+        let mut from_front: Vec<K> = Vec::new();
+        let mut from_back: Vec<K> = Vec::new();
+        for turn in 0.. {
+            let next = if turn % 2 == 0 { iter.next() } else { iter.next_back() };
+            let Some((key, value)) = next else { break };
+            value.check((self.id_of)(key));
+            if turn % 2 == 0 { from_front.push(key.clone()) } else { from_back.push(key.clone()) }
+        }
+        from_front.extend(from_back.into_iter().rev());
+        assert_eq!(from_front, in_key_order, "iter_mut after the race");
+        let taken: Vec<K> = (self.map.into_iter())
+            .map(|(key, value)| {
+                value.check((self.id_of)(&key));
+                key
+            })
+            .collect();
+        assert_eq!(taken, in_key_order, "into_iter after the race");
     }
 
     /// What the map holds of the keys numbered `ids`, by slot.
@@ -2073,4 +2276,1112 @@ fn copied_lookups_race_pages_churning() {
     }
     assert_eq!(map.get_copied(&last), Some(copied_value(last)));
     map.check_invariants(len as usize);
+}
+
+// Linearizability: threads that share keys, their histories checked.
+//
+// The model scenarios above give each thread keys of its own, so what one
+// thread does to a key is never seen by another: a lost update, a stale
+// copy or a value returned to two threads would pass. Here every thread
+// works on the same few keys, each call is stamped with a global counter
+// before and after, and the history of each key is checked for
+// linearizability against a register (insert and remove return the value
+// they replaced, `update` the one it changed, `get_or_insert` the one
+// present or its own, lookups the current one): some order of the calls,
+// consistent with the stamps, that the register explains. An entry a scan
+// or a cloned range hands out is a lookup that ran while that call did;
+// the lanes of a batch are lookups or inserts that ran while the batch did.
+// A map's operations touch one entry each, so a history is linearizable
+// if every key's is.
+
+/// A value a [`SharedKeysRun`] stores: made for a key, told apart from
+/// every other value of that key, checked for life like [`Tracked`], and
+/// looked up the way its type allows (a closure under the latch, or a
+/// latch-free copy for `Copy` values).
+trait SharedValue<'f>: Send + Sync + Sized + Clone {
+    fn make(fx: &'f Fixture, id: u64) -> Self;
+    /// Which value this is, through clones.
+    fn ident(&self) -> u64;
+    /// Panics unless this is a live value of the key numbered `id`.
+    fn check(&self, id: u64);
+    fn lookup<K: Ord, S: InlineKeyStrategy<K>>(map: &BBTreeMap<K, Self, S, &'f Pages>, key: &K, id: u64) -> Option<u64>;
+    fn lookup_many<K: Ord, S: InlineKeyStrategy<K>>(
+        map: &BBTreeMap<K, Self, S, &'f Pages>,
+        keys: [&K; 3],
+        id_of: fn(&K) -> u64,
+    ) -> [Option<u64>; 3];
+    /// `get_cloned`: a clone made under the latch.
+    fn lookup_cloned<K: Ord, S: InlineKeyStrategy<K>>(map: &BBTreeMap<K, Self, S, &'f Pages>, key: &K, id: u64) -> Option<u64> {
+        let found = map.get_cloned(key);
+        if let Some(value) = &found {
+            value.check(id);
+        }
+        found.map(|value| value.ident())
+    }
+    /// `get_many_cloned`.
+    fn lookup_many_cloned<K: Ord, S: InlineKeyStrategy<K>>(
+        map: &BBTreeMap<K, Self, S, &'f Pages>,
+        keys: [&K; 3],
+        id_of: fn(&K) -> u64,
+    ) -> [Option<u64>; 3] {
+        let found = map.get_many_cloned(keys);
+        let mut idents = [None; 3];
+        for (i, (key, value)) in keys.iter().zip(found).enumerate() {
+            if let Some(value) = value {
+                value.check(id_of(key));
+                idents[i] = Some(value.ident());
+            }
+        }
+        idents
+    }
+}
+
+impl<'f> SharedValue<'f> for Tracked<'f> {
+    fn make(fx: &'f Fixture, id: u64) -> Self {
+        fx.value(id)
+    }
+
+    fn ident(&self) -> u64 {
+        self.origin() as u64
+    }
+
+    fn check(&self, id: u64) {
+        Tracked::check(self, id)
+    }
+
+    fn lookup<K: Ord, S: InlineKeyStrategy<K>>(map: &BBTreeMap<K, Self, S, &'f Pages>, key: &K, id: u64) -> Option<u64> {
+        map.read(key, |_, value| {
+            value.check(id);
+            value.ident()
+        })
+    }
+
+    fn lookup_many<K: Ord, S: InlineKeyStrategy<K>>(
+        map: &BBTreeMap<K, Self, S, &'f Pages>,
+        keys: [&K; 3],
+        id_of: fn(&K) -> u64,
+    ) -> [Option<u64>; 3] {
+        map.read_many(keys, |key, value| {
+            value.check(id_of(key));
+            value.ident()
+        })
+    }
+}
+
+impl<'f> SharedValue<'f> for u64 {
+    fn make(fx: &'f Fixture, id: u64) -> Self {
+        fx.copied_value(id)
+    }
+
+    fn ident(&self) -> u64 {
+        *self
+    }
+
+    fn check(&self, id: u64) {
+        assert_eq!(*self >> 32, id, "a copy of another key's value, or torn: {self:#x}");
+    }
+
+    fn lookup<K: Ord, S: InlineKeyStrategy<K>>(map: &BBTreeMap<K, Self, S, &'f Pages>, key: &K, id: u64) -> Option<u64> {
+        let found = map.get_copied(key);
+        if let Some(value) = found {
+            value.check(id);
+        }
+        found
+    }
+
+    fn lookup_many<K: Ord, S: InlineKeyStrategy<K>>(
+        map: &BBTreeMap<K, Self, S, &'f Pages>,
+        keys: [&K; 3],
+        id_of: fn(&K) -> u64,
+    ) -> [Option<u64>; 3] {
+        let found = map.get_many_copied(keys);
+        for (key, value) in keys.iter().zip(&found) {
+            if let Some(value) = value {
+                value.check(id_of(key));
+            }
+        }
+        found
+    }
+}
+
+/// A call on one key, with what it took in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Call {
+    Insert(u64),
+    Remove,
+    Update(u64),
+    /// Removes the entry if its value's ident is even.
+    RemoveIf,
+    GetOrInsert(u64),
+    Read,
+    Contains,
+}
+
+/// A call on one key as a thread saw it: stamped before and after.
+#[derive(Clone, Copy, Debug)]
+struct Event {
+    id: u64,
+    call: Call,
+    /// The ident returned (`Contains`: `Some(1)` for true), or `None`.
+    result: Option<u64>,
+    inv: u64,
+    res: u64,
+    thread: usize,
+}
+
+impl Event {
+    /// Whether the value `ident` is one `RemoveIf` removes.
+    fn removable(ident: u64) -> bool {
+        ident % 2 == 0
+    }
+
+    /// The register after this call, from `state`, if `result` is what the
+    /// call returns on `state`.
+    fn step(&self, state: Option<u64>) -> Option<Option<u64>> {
+        let result = self.result;
+        match self.call {
+            Call::Insert(new) => (result == state).then_some(Some(new)),
+            Call::Remove => (result == state).then_some(None),
+            Call::Update(new) => match state {
+                None => result.is_none().then_some(None),
+                Some(old) => (result == Some(old)).then_some(Some(new)),
+            },
+            Call::RemoveIf => match state {
+                Some(old) if Self::removable(old) => (result == Some(old)).then_some(None),
+                _ => result.is_none().then_some(state),
+            },
+            Call::GetOrInsert(new) => match state {
+                None => (result == Some(new)).then_some(Some(new)),
+                Some(old) => (result == Some(old)).then_some(state),
+            },
+            Call::Read => (result == state).then_some(state),
+            Call::Contains => (result.is_some() == state.is_some()).then_some(state),
+        }
+    }
+}
+
+/// The calls of a history already placed: a bitset of any length.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Placed(Vec<u64>);
+
+impl Placed {
+    fn none(len: usize) -> Self {
+        Self(std::vec![0; len.div_ceil(64)])
+    }
+
+    fn has(&self, i: usize) -> bool {
+        self.0[i / 64] & (1 << (i % 64)) != 0
+    }
+
+    fn with(&self, i: usize) -> Self {
+        let mut next = self.clone();
+        next.0[i / 64] |= 1 << (i % 64);
+        next
+    }
+
+    fn count(&self) -> usize {
+        self.0.iter().map(|w| w.count_ones() as usize).sum()
+    }
+}
+
+/// The linearizability check of one key's history: a depth-first search
+/// for an order of the calls in which each call starts before every call
+/// not yet placed ends, and the register explains every result (Wing and
+/// Gong), with the states reached memoized.
+struct KeyHistory<'e> {
+    events: &'e [Event],
+    seen: HashSet<(Placed, Option<u64>)>,
+}
+
+impl<'e> KeyHistory<'e> {
+    fn check(id: u64, events: &'e [Event], initial: Option<u64>) {
+        let mut history = Self {
+            events,
+            seen: HashSet::new(),
+        };
+        if !history.explained(Placed::none(events.len()), initial) {
+            let mut lines = std::vec![format!("key {id}: history not linearizable from {initial:?}:")];
+            let mut sorted: Vec<&Event> = events.iter().collect();
+            sorted.sort_by_key(|e| e.inv);
+            for e in sorted {
+                lines.push(format!(
+                    "  [{:4}, {:4}] T{} {:?} -> {:?}",
+                    e.inv, e.res, e.thread, e.call, e.result
+                ));
+            }
+            panic!("{}", lines.join("\n"));
+        }
+    }
+
+    fn explained(&mut self, done: Placed, state: Option<u64>) -> bool {
+        if done.count() == self.events.len() {
+            return true;
+        }
+        if !self.seen.insert((done.clone(), state)) {
+            return false;
+        }
+        let first_end = (self.events.iter().enumerate())
+            .filter(|(i, _)| !done.has(*i))
+            .map(|(_, e)| e.res)
+            .min()
+            .unwrap();
+        for (i, event) in self.events.iter().enumerate() {
+            if done.has(i) || event.inv > first_end {
+                continue;
+            }
+            if let Some(next) = event.step(state) {
+                if self.explained(done.with(i), next) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// A map shared by threads that all work on the same keys, numbered.
+struct SharedKeysRun<'f, K, V, S: InlineKeyStrategy<K> = Auto> {
+    map: BBTreeMap<K, V, S, &'f Pages>,
+    fx: &'f Fixture,
+    key_of: fn(u64) -> K,
+    id_of: fn(&K) -> u64,
+    /// The numbers of the keys the threads share.
+    ids: Vec<u64>,
+    /// The span of the map the keys lie in, which scans cover.
+    span: (Bound<K>, Bound<K>),
+    clock: AtomicU64,
+}
+
+impl<K, V, S: InlineKeyStrategy<K>> SharedKeysRun<'_, K, V, S> {
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+impl<'f, K: Ord + Clone + fmt::Debug + Send + Sync, V: SharedValue<'f>, S: InlineKeyStrategy<K> + Sync> SharedKeysRun<'f, K, V, S> {
+    fn new(
+        map: BBTreeMap<K, V, S, &'f Pages>,
+        fx: &'f Fixture,
+        key_of: fn(u64) -> K,
+        id_of: fn(&K) -> u64,
+        ids: Vec<u64>,
+        span: (Bound<K>, Bound<K>),
+    ) -> Self {
+        Self {
+            map,
+            fx,
+            key_of,
+            id_of,
+            ids,
+            span,
+            clock: AtomicU64::new(0),
+        }
+    }
+
+    /// Runs `threads` threads (or `FFS_BBTREE_THREADS`) of `operations`
+    /// random calls each (or `FFS_BBTREE_OPS`) on the shared keys, then
+    /// checks every key's history, the keys' final values against it, and
+    /// the tree.
+    fn run(mut self, threads: usize, operations: usize) {
+        let settings = Settings::from_env();
+        let threads = settings.threads.unwrap_or(threads);
+        let operations = settings.operations.unwrap_or(operations);
+        let initial: BTreeMap<u64, Option<u64>> = (self.ids.iter())
+            .map(|&id| (id, V::lookup(&self.map, &(self.key_of)(id), id)))
+            .collect();
+        self.fx.race();
+        let mut events: Vec<Event> = thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|index| {
+                    let run = &self;
+                    scope.spawn(move || {
+                        SharedKeysThread {
+                            run,
+                            thread: index,
+                            rng: Rng::new(settings.seed * 1000 + 500 + index as u64),
+                            events: Vec::new(),
+                        }
+                        .run(operations)
+                    })
+                })
+                .collect();
+            (handles.into_iter())
+                .flat_map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        // The final state, a lookup after every call.
+        for &id in &self.ids {
+            let inv = self.tick();
+            let result = V::lookup(&self.map, &(self.key_of)(id), id);
+            let res = self.tick();
+            events.push(Event {
+                id,
+                call: Call::Read,
+                result,
+                inv,
+                res,
+                thread: threads,
+            });
+        }
+        for &id in &self.ids {
+            let of_key: Vec<Event> = events.iter().filter(|e| e.id == id).copied().collect();
+            KeyHistory::check(id, &of_key, initial[&id]);
+        }
+        let mut count = 0;
+        self.map.scan::<K, ()>(.., |key, value| {
+            value.check((self.id_of)(key));
+            count += 1;
+            ControlFlow::Continue(())
+        });
+        self.map.check_invariants(count);
+        assert_eq!(self.map.iter_mut().count(), count, "iter_mut after the race");
+    }
+}
+
+/// One thread of a [`SharedKeysRun`].
+struct SharedKeysThread<'r, 'f, K, V, S: InlineKeyStrategy<K>> {
+    run: &'r SharedKeysRun<'f, K, V, S>,
+    thread: usize,
+    rng: Rng,
+    events: Vec<Event>,
+}
+
+impl<'f, K: Ord + Clone + fmt::Debug, V: SharedValue<'f>, S: InlineKeyStrategy<K>> SharedKeysThread<'_, 'f, K, V, S> {
+    fn run(mut self, operations: usize) -> Vec<Event> {
+        for _ in 0..operations {
+            let id = self.pick();
+            match self.rng.below(100) {
+                0..18 => self.insert(id),
+                18..28 => self.remove(id),
+                28..33 => self.remove_entry(id),
+                33..41 => self.update(id),
+                41..46 => self.remove_if(id),
+                46..53 => self.get_or_insert(id),
+                53..62 => self.read(id),
+                62..67 => self.read_cloned(id),
+                67..71 => self.contains(id),
+                71..77 => self.read_many(id),
+                77..81 => self.read_many_cloned(id),
+                81..86 => self.insert_many(id),
+                86..94 => {
+                    let reverse = self.rng.below(2) == 1;
+                    self.scan(reverse)
+                }
+                _ => self.range_cloned(),
+            }
+        }
+        self.events
+    }
+
+    fn pick(&mut self) -> u64 {
+        self.run.ids[self.rng.below(self.run.ids.len())]
+    }
+
+    fn key(&self, id: u64) -> K {
+        (self.run.key_of)(id)
+    }
+
+    fn record(&mut self, id: u64, call: Call, result: Option<u64>, inv: u64, res: u64) {
+        self.events.push(Event {
+            id,
+            call,
+            result,
+            inv,
+            res,
+            thread: self.thread,
+        });
+    }
+
+    fn insert(&mut self, id: u64) {
+        let value = V::make(self.run.fx, id);
+        let new = value.ident();
+        let inv = self.run.tick();
+        let old = self.run.map.insert(self.key(id), value).map(|old| {
+            old.check(id);
+            old.ident()
+        });
+        let res = self.run.tick();
+        self.record(id, Call::Insert(new), old, inv, res);
+    }
+
+    fn remove(&mut self, id: u64) {
+        let inv = self.run.tick();
+        let old = self.run.map.remove(&self.key(id)).map(|old| {
+            old.check(id);
+            old.ident()
+        });
+        let res = self.run.tick();
+        self.record(id, Call::Remove, old, inv, res);
+    }
+
+    fn remove_entry(&mut self, id: u64) {
+        let key = self.key(id);
+        let inv = self.run.tick();
+        let old = self.run.map.remove_entry(&key).map(|(k, old)| {
+            assert!(k == key, "remove_entry returned another key");
+            old.check(id);
+            old.ident()
+        });
+        let res = self.run.tick();
+        self.record(id, Call::Remove, old, inv, res);
+    }
+
+    fn read_cloned(&mut self, id: u64) {
+        let inv = self.run.tick();
+        let found = V::lookup_cloned(&self.run.map, &self.key(id), id);
+        let res = self.run.tick();
+        self.record(id, Call::Read, found, inv, res);
+    }
+
+    fn read_many_cloned(&mut self, id: u64) {
+        let ids = [id, self.pick(), self.pick()];
+        let keys = ids.map(|id| self.key(id));
+        let inv = self.run.tick();
+        let found = V::lookup_many_cloned(&self.run.map, [&keys[0], &keys[1], &keys[2]], self.run.id_of);
+        let res = self.run.tick();
+        for (id, found) in ids.into_iter().zip(found) {
+            self.record(id, Call::Read, found, inv, res);
+        }
+    }
+
+    fn update(&mut self, id: u64) {
+        let value = V::make(self.run.fx, id);
+        let new = value.ident();
+        let inv = self.run.tick();
+        let old = self.run.map.update(&self.key(id), |_, old| {
+            old.check(id);
+            mem::replace(old, value).ident()
+        });
+        let res = self.run.tick();
+        self.record(id, Call::Update(new), old, inv, res);
+    }
+
+    fn remove_if(&mut self, id: u64) {
+        let inv = self.run.tick();
+        let removed = self
+            .run
+            .map
+            .remove_if(&self.key(id), |_, value| {
+                value.check(id);
+                Event::removable(value.ident())
+            })
+            .map(|(_, value)| value.ident());
+        let res = self.run.tick();
+        self.record(id, Call::RemoveIf, removed, inv, res);
+    }
+
+    fn get_or_insert(&mut self, id: u64) {
+        let value = V::make(self.run.fx, id);
+        let new = value.ident();
+        let inv = self.run.tick();
+        let seen = self.run.map.get_or_insert(self.key(id), value, |_, value| {
+            value.check(id);
+            value.ident()
+        });
+        let res = self.run.tick();
+        self.record(id, Call::GetOrInsert(new), Some(seen), inv, res);
+    }
+
+    fn read(&mut self, id: u64) {
+        let inv = self.run.tick();
+        let found = V::lookup(&self.run.map, &self.key(id), id);
+        let res = self.run.tick();
+        self.record(id, Call::Read, found, inv, res);
+    }
+
+    fn contains(&mut self, id: u64) {
+        let inv = self.run.tick();
+        let found = self.run.map.contains_key(&self.key(id));
+        let res = self.run.tick();
+        self.record(id, Call::Contains, found.then_some(1), inv, res);
+    }
+
+    /// A batch of three shared keys.
+    fn read_many(&mut self, id: u64) {
+        let ids = [id, self.pick(), self.pick()];
+        let keys = ids.map(|id| self.key(id));
+        let inv = self.run.tick();
+        let found = V::lookup_many(&self.run.map, [&keys[0], &keys[1], &keys[2]], self.run.id_of);
+        let res = self.run.tick();
+        for (id, found) in ids.into_iter().zip(found) {
+            self.record(id, Call::Read, found, inv, res);
+        }
+    }
+
+    /// A batch of two shared keys, distinct (`insert_many` of one key twice
+    /// is the caller's own ordering problem).
+    fn insert_many(&mut self, id: u64) {
+        let mut other = self.pick();
+        while other == id {
+            other = self.pick();
+        }
+        let ids = [id, other];
+        let values = ids.map(|id| V::make(self.run.fx, id));
+        let new = [values[0].ident(), values[1].ident()];
+        let [v0, v1] = values;
+        let inv = self.run.tick();
+        let old = self
+            .run
+            .map
+            .insert_many([(self.key(ids[0]), v0), (self.key(ids[1]), v1)]);
+        let res = self.run.tick();
+        for ((id, new), old) in ids.into_iter().zip(new).zip(old) {
+            let old = old.map(|old| {
+                old.check(id);
+                old.ident()
+            });
+            self.record(id, Call::Insert(new), old, inv, res);
+        }
+    }
+
+    /// The span, or a range between two shared keys with bounds of every
+    /// kind (empty ones included).
+    fn bounds(&mut self) -> (Bound<K>, Bound<K>) {
+        if self.rng.below(2) == 0 {
+            return self.run.span.clone();
+        }
+        let (a, b) = (self.pick(), self.pick());
+        let (mut lo, mut hi) = (self.key(a), self.key(b));
+        if lo > hi {
+            mem::swap(&mut lo, &mut hi);
+        }
+        let bound = |rng: &mut Rng, key: K, open: Bound<K>| match rng.below(3) {
+            0 => Bound::Included(key),
+            1 => Bound::Excluded(key),
+            _ => open,
+        };
+        let (start, end) = self.run.span.clone();
+        let equal = lo == hi;
+        let start = bound(&mut self.rng, lo, start);
+        let mut end = bound(&mut self.rng, hi, end);
+        if equal && matches!((&start, &end), (Bound::Excluded(_), Bound::Excluded(_))) {
+            // Both ends excluded on one key is a panic (as in std), not a
+            // range.
+            end = Bound::Unbounded;
+            let _ = mem::replace(&mut end, self.run.span.1.clone());
+        }
+        (start, end)
+    }
+
+    /// A scan of the span or of a range inside it: in order, once each,
+    /// inside the bounds, every entry a lookup during the scan.
+    fn scan(&mut self, reverse: bool) {
+        let bounds = self.bounds();
+        let mut visited: Vec<(u64, u64)> = Vec::new();
+        let id_of = self.run.id_of;
+        let visit = |key: &K, value: &V| {
+            let id = id_of(key);
+            value.check(id);
+            visited.push((id, value.ident()));
+            ControlFlow::<()>::Continue(())
+        };
+        let inv = self.run.tick();
+        if reverse {
+            self.run.map.scan_rev::<K, ()>(bounds.clone(), visit);
+            visited.reverse();
+        } else {
+            self.run.map.scan::<K, ()>(bounds.clone(), visit);
+        }
+        let res = self.run.tick();
+        let keys: Vec<K> = visited.iter().map(|&(id, _)| self.key(id)).collect();
+        assert!(keys.is_sorted_by(|a, b| a < b), "visited out of order, or twice: {keys:?}");
+        for key in &keys {
+            assert!(bounds.contains(key), "visited {key:?} outside {bounds:?}");
+        }
+        for (id, ident) in visited {
+            if self.run.ids.contains(&id) {
+                self.record(id, Call::Read, Some(ident), inv, res);
+            }
+        }
+    }
+
+    /// A cloned range over the span, taken from either end at random: each
+    /// entry handed out a lookup during that call, the whole in order.
+    fn range_cloned(&mut self) {
+        let mut range = self.run.map.range_cloned::<K, _>(self.run.span.clone());
+        let (mut front, mut back) = (Vec::new(), Vec::new());
+        loop {
+            let from_front = self.rng.below(2) == 0;
+            let inv = self.run.tick();
+            let next = if from_front { range.next() } else { range.next_back() };
+            let res = self.run.tick();
+            let Some((key, value)) = next else {
+                break;
+            };
+            let id = (self.run.id_of)(&key);
+            value.check(id);
+            if self.run.ids.contains(&id) {
+                self.record(id, Call::Read, Some(value.ident()), inv, res);
+            }
+            if from_front {
+                front.push(key);
+            } else {
+                back.push(key);
+            }
+        }
+        front.extend(back.into_iter().rev());
+        assert!(front.is_sorted_by(|a, b| a < b), "handed out out of order, or twice: {front:?}");
+    }
+}
+
+/// The keys numbered `indexes` and the ones 5 past each: present ones and
+/// absent ones between them.
+fn shared_ids(indexes: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    (indexes.into_iter()).flat_map(|i| [key(i), key(i) + 5]).collect()
+}
+
+/// Four threads on ten keys of a full root leaf, in its middle and at its
+/// end: it splits, the halves split and merge, the tree lowers back and
+/// is raised again, and every thread's calls on every key linearize.
+#[test]
+fn shared_keys_are_linearizable_around_a_splitting_leaf() {
+    let shapes = Shapes::probe();
+    let fx = Fixture::new();
+    let (map, len) = shapes.full(&fx, 1);
+    let mid = len / 2;
+    let ids = shared_ids([mid - 1, mid, len - 1, len, len + 1]);
+    SharedKeysRun::new(
+        map,
+        &fx,
+        |id| id,
+        same,
+        ids,
+        (Bound::Included(key(mid - 1)), Bound::Included(key(len + 1) + 5)),
+    )
+    .run(4, 16);
+}
+
+/// Four threads on ten keys of the last leaves of a tree of three levels,
+/// which a merge lowers to two and appends raise again, their calls
+/// linearizable.
+#[test]
+fn shared_keys_are_linearizable_in_three_levels() {
+    let shapes = Shapes::probe();
+    let fx = Fixture::new();
+    let (map, len) = shapes.one_removal_from_lowering(&fx, 2);
+    let ids = shared_ids([len - 3, len - 2, len - 1, len, len + 1]);
+    SharedKeysRun::new(
+        map,
+        &fx,
+        |id| id,
+        same,
+        ids,
+        (Bound::Included(key(len - 3)), Bound::Included(key(len + 1) + 5)),
+    )
+    .run(4, 16);
+}
+
+/// [`shared_keys_are_linearizable_around_a_splitting_leaf`] with `Copy`
+/// values, whose lookups copy without a latch: every copy linearizes too,
+/// as do `contains_key` and the batched copies.
+#[test]
+fn copied_lookups_of_shared_keys_are_linearizable() {
+    let shapes = CopiedShapes::probe();
+    let fx = Fixture::new();
+    let len = shapes.capacity[0];
+    let map: BBTreeMap<u64, u64, Auto, &Pages> = BBTreeMap::new_in(&fx.pages);
+    for index in 0..len {
+        assert!(map.insert(key(index), fx.copied_value(key(index))).is_none());
+    }
+    let mid = len / 2;
+    let ids = shared_ids([mid - 1, mid, len - 1, len, len + 1]);
+    SharedKeysRun::new(
+        map,
+        &fx,
+        |id| id,
+        same,
+        ids,
+        (Bound::Included(key(mid - 1)), Bound::Included(key(len + 1) + 5)),
+    )
+    .run(4, 16);
+}
+
+/// Three threads on string keys whose 4-byte windows tie in the internal
+/// node, so that descents compare the tied separator's head, latched,
+/// while the threads remove and reinsert it: linearizable.
+#[test]
+fn shared_string_keys_are_linearizable_at_tied_separators() {
+    fn key_of(id: u64) -> String {
+        format!("tie/{}/{id:06}", id % 2)
+    }
+    #[expect(clippy::ptr_arg, reason = "the map's keys are `String`s")]
+    fn id_of(key: &String) -> u64 {
+        key[key.len() - 6..].parse().expect("a numbered key")
+    }
+    let fx = Fixture::new();
+    let map = fx.map::<String>();
+    for id in 0..14 {
+        map.insert(key_of(id), fx.value(id));
+    }
+    SharedKeysRun::new(
+        map,
+        &fx,
+        key_of,
+        id_of,
+        (8..18).collect(),
+        (Bound::Unbounded, Bound::Unbounded),
+    )
+    .run(3, 16);
+}
+
+/// Six threads on fourteen keys of a full root leaf: more contention on
+/// the latch of the one leaf and its halves, every call linearizable.
+#[test]
+fn six_threads_share_keys_of_a_splitting_leaf() {
+    let shapes = Shapes::probe();
+    let fx = Fixture::new();
+    let (map, len) = shapes.full(&fx, 1);
+    let mid = len / 2;
+    let ids = shared_ids([mid - 2, mid - 1, mid, len - 2, len - 1, len, len + 1]);
+    SharedKeysRun::new(
+        map,
+        &fx,
+        |id| id,
+        same,
+        ids,
+        (Bound::Included(key(mid - 2)), Bound::Included(key(len + 1) + 5)),
+    )
+    .run(6, 12);
+}
+
+// Blind spots of the rounds above: four levels, byte-array keys and the
+// shared prefix, panics in clones and the other closures, `Debug`.
+
+/// The shape probe for a tree of four levels (the `Shapes` probe stops at
+/// three): about 27,000 `Tracked` entries.
+struct DeepShapes {
+    /// Keys a tree of three levels holds before the next append raises it
+    /// to four.
+    capacity: u64,
+    /// Keys left when, removing from the end of a tree raised to four
+    /// levels, the next removal lowers it to three.
+    lowering_len: u64,
+}
+
+impl DeepShapes {
+    fn probe() -> Self {
+        let fx = Fixture::new();
+        let mut map = fx.map::<u64>();
+        let mut len = 0;
+        // Inserting by blocks (a walk of the whole tree per check is slow),
+        // then again from scratch, one at a time past the last block's
+        // start: removals would leave another shape than appends make.
+        const BLOCK: u64 = 64;
+        while map.node_lengths().len() < 4 {
+            for _ in 0..BLOCK {
+                map.insert(key(len), fx.value(key(len)));
+                len += 1;
+            }
+        }
+        drop(map);
+        let fx = Fixture::new();
+        let mut map = map_of(&fx, len - BLOCK);
+        len -= BLOCK;
+        while map.node_lengths().len() < 4 {
+            map.insert(key(len), fx.value(key(len)));
+            len += 1;
+        }
+        let capacity = len - 1;
+        while map.node_lengths().len() > 3 {
+            len -= 1;
+            map.remove(&key(len));
+        }
+        Self {
+            capacity,
+            lowering_len: len + 1,
+        }
+    }
+
+    /// A tree of four levels which a removal of its last key lowers to
+    /// three; how many keys it holds.
+    fn one_removal_from_lowering<'f>(&self, fx: &'f Fixture) -> (TrackedMap<'f>, u64) {
+        let map = map_of(fx, self.capacity + 1);
+        for index in self.lowering_len..self.capacity + 1 {
+            assert!(map.remove(&key(index)).is_some());
+        }
+        (map, self.lowering_len)
+    }
+}
+
+/// A tree of four levels lowers to three (a merge under the root's last
+/// child empties the root) while appends raise it back, under lookups and
+/// scans of its last keys: every change passes through two internal
+/// levels, which no three-level scenario makes.
+#[test]
+fn lowering_through_four_levels_races_appends_and_lookups() {
+    let shapes = DeepShapes::probe();
+    let fx = Fixture::new();
+    let (mut map, len) = shapes.one_removal_from_lowering(&fx);
+    assert_eq!(map.node_lengths().len(), 4);
+    let appended = [key(len), key(len + 1), key(len + 2)];
+    let steady: Vec<u64> = (len - 40..len - 2).map(key).collect();
+    fx.race();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(map.remove(&key(len - 1)).is_some());
+            assert!(map.remove(&key(len - 2)).is_some());
+        });
+        scope.spawn(|| {
+            for k in appended {
+                assert!(map.insert(k, fx.value(k)).is_none());
+            }
+        });
+        scope.spawn(|| {
+            for _ in 0..3 {
+                for k in [key(len - 3), key(len - 1), key(len + 1)] {
+                    let _ = map.read(&k, |_, value| value.check(k));
+                }
+                let found = map.read_many([&key(len - 40), &key(len - 1), &key(len + 2)], |key, value| value.check(*key));
+                assert!(found[0].is_some());
+            }
+        });
+        scope.spawn(|| {
+            for reverse in [false, true, false] {
+                let visited = scanned_keys(&map, key(len - 40).., same, reverse);
+                assert_visited_in_order(&visited, &steady);
+            }
+        });
+    });
+    for k in appended {
+        assert!(map.read(&k, |_, value| value.check(k)).is_some(), "key {k} missing");
+    }
+    map.check_invariants(len as usize - 2 + appended.len());
+    // Whether the tree ends at three or four levels depends on the order:
+    // appends into the leaf a lowering merged fill it before they split it.
+    assert!(matches!(map.node_lengths().len(), 3 | 4));
+}
+
+/// Four threads on byte-array keys that share eight leading bytes, and
+/// three outliers that share seven, five and two, each of whose first
+/// insert shrinks the shared prefix while the others' calls run; all
+/// linearizable.
+#[test]
+fn shared_byte_array_keys_shrink_the_prefix_while_linearizable() {
+    fn key_of(id: u64) -> [u8; 12] {
+        let head: &[u8; 8] = match id {
+            0..9000 => b"shared/0",
+            9000..9100 => b"shared/1",
+            9100..9200 => b"share_/0",
+            _ => b"sh____/0",
+        };
+        let number = if id < 9000 { id } else { id % 100 };
+        let mut key = [0u8; 12];
+        key[..8].copy_from_slice(head);
+        key[8..].copy_from_slice(format!("{number:04}").as_bytes());
+        key
+    }
+    fn id_of(key: &[u8; 12]) -> u64 {
+        let number: u64 = std::str::from_utf8(&key[8..]).unwrap().parse().unwrap();
+        match &key[..8] {
+            b"shared/0" => number,
+            b"shared/1" => 9000 + number,
+            b"share_/0" => 9100 + number,
+            _ => 9200 + number,
+        }
+    }
+    let fx = Fixture::new();
+    let mut map: BBTreeMap<[u8; 12], Tracked<'_>, WithInlineKey, &Pages> = BBTreeMap::new_in(&fx.pages);
+    for id in 0..16 {
+        map.insert(key_of(id), fx.value(id));
+    }
+    assert!(map.shared_prefix_len() >= 8, "the keys share their head");
+    let ids: Vec<u64> = (10..16).chain([9050, 9150, 9250]).collect();
+    SharedKeysRun::new(map, &fx, key_of, id_of, ids, (Bound::Unbounded, Bound::Unbounded)).run(4, 16);
+}
+
+/// Panics in the closures and clones the first panic scenario leaves
+/// alone: `get_cloned`, `range_cloned` and `get_many_cloned` cloning a
+/// value whose `Clone` panics (under the leaf's latch), and the closures
+/// of `scan`, `scan_rev`, `read_many` and `get_or_insert`; another thread
+/// reads and inserts into the same leaf meanwhile, so a leaked latch spins
+/// it to the depth bound.
+#[test]
+fn panicking_clones_scans_and_batches_let_other_threads_through() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let shapes = Shapes::probe();
+    let fx = Fixture::new();
+    let (mut map, len) = shapes.full(&fx, 1);
+    let (target, inserted) = (key(len / 2), key(len / 2) + 5);
+    let target_slot = map.read(&target, |_, value| value.slot()).unwrap();
+    fx.race();
+    thread::scope(|scope| {
+        let (map, fx) = (&map, &fx);
+        scope.spawn(move || {
+            panic_on_clone(true);
+            assert!(catch_unwind(AssertUnwindSafe(|| map.get_cloned(&target))).is_err());
+            assert!(catch_unwind(AssertUnwindSafe(|| map.range_cloned::<u64, _>(target..).next())).is_err());
+            assert!(catch_unwind(AssertUnwindSafe(|| map.range_cloned::<u64, _>(..=target).next_back())).is_err());
+            assert!(catch_unwind(AssertUnwindSafe(|| map.get_many_cloned([&target, &key(0)]))).is_err());
+            panic_on_clone(false);
+            assert!(catch_unwind(AssertUnwindSafe(|| {
+                map.scan::<u64, ()>(.., |_, _| panic!("expected panic in user code (scan)"))
+            }))
+            .is_err());
+            assert!(catch_unwind(AssertUnwindSafe(|| {
+                map.scan_rev::<u64, ()>(.., |_, _| panic!("expected panic in user code (scan_rev)"))
+            }))
+            .is_err());
+            assert!(catch_unwind(AssertUnwindSafe(|| {
+                map.read_many([&target, &key(0)], |_, _| panic!("expected panic in user code (read_many)"))
+            }))
+            .is_err());
+            assert!(catch_unwind(AssertUnwindSafe(|| {
+                map.get_or_insert(target, fx.value(target), |_, _| panic!("expected panic in user code (get_or_insert)"))
+            }))
+            .is_err());
+        });
+        scope.spawn(|| {
+            for _ in 0..4 {
+                let slot = map.read(&target, |_, value| {
+                    value.check(target);
+                    value.slot()
+                });
+                assert_eq!(slot, Some(target_slot), "the entry changed under a panicking closure");
+                assert_eq!(map.get_cloned(&target).map(|v| v.origin()), Some(target_slot));
+            }
+            assert!(map.insert(inserted, fx.value(inserted)).is_none());
+            assert!(map.read(&inserted, |_, value| value.check(inserted)).is_some());
+        });
+    });
+    assert_eq!(map.read(&target, |_, value| value.slot()), Some(target_slot));
+    let all = scanned_keys(&map, .., same, false);
+    assert_eq!(all.len(), len as usize + 1);
+    map.check_invariants(len as usize + 1);
+}
+
+/// `Debug` of the map (a scan, not a snapshot) while the root leaf splits
+/// and the tree lowers back: it never panics, and prints keys in order.
+#[test]
+fn debug_formatting_races_a_split_and_a_merge() {
+    let shapes = Shapes::probe();
+    let fx = Fixture::new();
+    let (mut map, len) = shapes.full(&fx, 1);
+    let added: Vec<u64> = (0..3).map(|i| key(len + i)).collect();
+    fx.race();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for &k in &added {
+                assert!(map.insert(k, fx.value(k)).is_none());
+            }
+            for &k in &added {
+                assert!(map.remove(&k).is_some());
+            }
+        });
+        scope.spawn(|| {
+            for _ in 0..3 {
+                let text = format!("{map:?}");
+                let keys: Vec<u64> = (text.split(": Tracked("))
+                    .filter_map(|piece| piece.rsplit(|c: char| !c.is_ascii_digit()).next())
+                    .filter(|digits| !digits.is_empty())
+                    .map(|digits| digits.parse().unwrap())
+                    .collect();
+                assert!(keys.len() >= len as usize, "Debug lost steady keys: {keys:?}");
+                assert!(keys.is_sorted_by(|a, b| a < b), "Debug out of order: {keys:?}");
+                ffs::point();
+            }
+        });
+    });
+    map.check_invariants(len as usize);
+}
+
+/// A scan whose start key lacks the shared prefix and sorts below every
+/// key, while another thread inserts a key that shrinks the shared prefix
+/// and sorts below the start too: the scan must not visit that key. (A
+/// minimal form of what
+/// [`shared_byte_array_keys_shrink_the_prefix_while_linearizable`] found
+/// under the root's watchpoint.)
+#[test]
+fn scans_from_below_the_shared_prefix_race_a_shrink() {
+    let fx = Fixture::new();
+    let map: BBTreeMap<[u8; 12], Tracked<'_>, WithInlineKey, &Pages> = BBTreeMap::new_in(&fx.pages);
+    // The map's keys share "shared/0"; the scan starts from "share_/0000",
+    // below them all; the outlier "sh____/0000" sorts below the start.
+    for id in 0..6u64 {
+        let mut key = *b"shared/00000";
+        key[8..].copy_from_slice(format!("{id:04}").as_bytes());
+        map.insert(key, fx.value(id));
+    }
+    let start = *b"share_/00000";
+    let outlier = *b"sh____/00000";
+    fx.race();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for _ in 0..2 {
+                map.scan::<[u8; 12], ()>(start.., |key, _| {
+                    assert!(*key >= start, "visited {:?} below the start {:?}", std::str::from_utf8(key), std::str::from_utf8(&start));
+                    ControlFlow::Continue(())
+                });
+                let first = map.range_cloned::<[u8; 12], _>(start..).next();
+                if let Some((key, _)) = first {
+                    assert!(key >= start, "handed out {:?} below the start", std::str::from_utf8(&key));
+                }
+            }
+        });
+        scope.spawn(|| {
+            assert!(map.insert(outlier, fx.value(9000)).is_none());
+        });
+    });
+}
+
+/// The sequential form of the scenario above: no race, one thread.
+#[test]
+fn scans_from_below_the_shared_prefix_sequentially() {
+    let fx = Fixture::new();
+    let map: BBTreeMap<[u8; 12], Tracked<'_>, WithInlineKey, &Pages> = BBTreeMap::new_in(&fx.pages);
+    for id in 0..6u64 {
+        let mut key = *b"shared/00000";
+        key[8..].copy_from_slice(format!("{id:04}").as_bytes());
+        map.insert(key, fx.value(id));
+    }
+    let start = *b"share_/00000";
+    let outlier = *b"sh____/00000";
+    let visited = |map: &BBTreeMap<[u8; 12], Tracked<'_>, WithInlineKey, &Pages>| {
+        let mut keys = Vec::new();
+        map.scan::<[u8; 12], ()>(start.., |key, _| {
+            keys.push(String::from_utf8_lossy(key).into_owned());
+            ControlFlow::Continue(())
+        });
+        keys
+    };
+    let before = visited(&map);
+    assert!(map.insert(outlier, fx.value(9000)).is_none());
+    let after = visited(&map);
+    let first_cloned = map.range_cloned::<[u8; 12], _>(start..).next().map(|(k, _)| String::from_utf8_lossy(&k).into_owned());
+    let shared = map.read(&outlier, |_, _| ()).is_some();
+    assert!(after.iter().all(|k| k.as_bytes() >= &start[..]), "before {before:?}, after {after:?}, first cloned {first_cloned:?}, outlier present {shared}");
+}
+
+/// The mirror of [`scans_from_below_the_shared_prefix_race_a_shrink`]: a
+/// reverse scan whose start key lacks the shared prefix and sorts above
+/// every key, while an insert that shrinks the prefix adds a key above the
+/// start.
+#[test]
+fn reverse_scans_from_above_the_shared_prefix_race_a_shrink() {
+    let fx = Fixture::new();
+    let map: BBTreeMap<[u8; 12], Tracked<'_>, WithInlineKey, &Pages> = BBTreeMap::new_in(&fx.pages);
+    for id in 0..6u64 {
+        let mut key = *b"shared/00000";
+        key[8..].copy_from_slice(format!("{id:04}").as_bytes());
+        map.insert(key, fx.value(id));
+    }
+    let start = *b"sharee/00000"; // above every "shared/..." key
+    let outlier = *b"shzzzz/00000"; // above the start
+    fx.race();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for _ in 0..2 {
+                map.scan_rev::<[u8; 12], ()>(..=start, |key, _| {
+                    assert!(*key <= start, "visited {:?} above the end {:?}", std::str::from_utf8(key), std::str::from_utf8(&start));
+                    ControlFlow::Continue(())
+                });
+                let last = map.range_cloned::<[u8; 12], _>(..=start).next_back();
+                if let Some((key, _)) = last {
+                    assert!(key <= start, "handed out {:?} above the end", std::str::from_utf8(&key));
+                }
+            }
+        });
+        scope.spawn(|| {
+            assert!(map.insert(outlier, fx.value(9000)).is_none());
+        });
+    });
 }

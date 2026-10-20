@@ -3,8 +3,10 @@
 
     ./run.py setup [--bbtree ~/repos/bbtree-src/bbtree]   # wire + build the harness
     ./run.py list                                           # the scenarios
-    ./run.py explore [SCENARIO ...] --iterations 2000 --seeds 1 2
+    ./run.py explore [SCENARIO ...] --iterations 2000 --seeds 1 2 -j 4
     ./run.py explore separator_lookups_race_a_merge --watch root --watch-hold 0.5
+    ./run.py explore --ffs-arg=--policy --ffs-arg=pct --ffs-arg=--pct-depth --ffs-arg=6
+    ./run.py explore --only shared --ops 60 --threads 6
     ./run.py native [SCENARIO ...] --runs 10000             # plain stress, no ffs
     ./run.py replay out/<scenario>/<tag>/fail-1.json
     ./run.py all
@@ -18,6 +20,7 @@ can read the tree's shape).  Each scenario sets a tree up, calls
 the race under many schedules.
 """
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -112,18 +115,31 @@ EXPLORED_RE = re.compile(r'explored (\d+) branches, (\d+) failing')
 
 def explore(args, scenario, seed):
     tag = f'{args.policy}-w{args.watch.replace(",", "+")}-h{args.watch_hold}-s{seed}'
+    if args.ops:
+        tag += f'-o{args.ops}'
+    if args.threads:
+        tag += f'-t{args.threads}'
     d = HERE / 'out' / (args.tag + scenario)
     d.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, FFS_BBTREE_WATCH=args.watch, FFS_BBTREE_SEED=str(seed))
     if args.ops:
         env['FFS_BBTREE_OPS'] = str(args.ops)
+    if args.threads:
+        env['FFS_BBTREE_THREADS'] = str(args.threads)
     cmd = [FFS, 'explore', '--iterations', args.iterations, '--seed', seed, '--keep-going',
            '--policy', args.policy, '--watch-hold', args.watch_hold, '--max-depth', args.max_depth,
            '--output-dir', d / tag]
     if args.watch != 'none':
         cmd += ['--watch-count', '0']  # the harness's watchpoints, not sampled globals
+    cmd += args.ffs_arg
     cmd += ['--', *harness_argv(scenario)]
-    r = sh(cmd, env=env, capture_output=True, text=True)
+    try:
+        r = sh(cmd, env=env, capture_output=True, text=True, timeout=args.timeout)
+    except subprocess.TimeoutExpired as e:
+        stderr = (e.stderr or b'').decode(errors='replace') if isinstance(e.stderr, bytes) else (e.stderr or '')
+        (d / f'{tag}.log').write_text(stderr + '\n[run] TIMEOUT\n')
+        print(f'[run] {scenario} {tag}: TIMEOUT after {args.timeout} s')
+        return None, {}
     (d / f'{tag}.log').write_text(r.stderr + r.stdout)
     failures = FAIL_RE.findall(r.stderr)
     explored = EXPLORED_RE.search(r.stderr)
@@ -147,28 +163,45 @@ def explore(args, scenario, seed):
     return explored, kinds
 
 
-def cmd_explore(args):
+def selected(args):
     names = args.scenarios or scenarios()
+    if args.only:
+        names = [n for n in names if re.search(args.only, n)]
+    if args.skip:
+        names = [n for n in names if not re.search(args.skip, n)]
+    return names
+
+
+def cmd_explore(args):
+    names = selected(args)
+    jobs = [(scenario, seed) for scenario in names for seed in args.seeds]
     total = failing = 0
-    for scenario in names:
-        for seed in args.seeds:
-            explored, _ = explore(args, scenario, seed)
+    failing_scenarios = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        for (scenario, seed), (explored, _) in zip(jobs, pool.map(lambda j: explore(args, *j), jobs)):
             if explored:
                 total += int(explored.group(1))
                 failing += int(explored.group(2))
-    print(f'[run] total: {total} branches, {failing} failing')
+                if int(explored.group(2)):
+                    failing_scenarios.append(f'{scenario} (seed {seed})')
+    print(f'[run] total: {total} branches, {failing} failing' + (': ' + ', '.join(failing_scenarios) if failing_scenarios else ''))
 
 
 def cmd_native(args):
     """Plain repeated native runs, for comparison (no ffs): the whole
     suite per run, so that the scenarios' own threads are the only load."""
-    names = args.scenarios or scenarios()
+    names = selected(args)
     fails = {name: 0 for name in names}
     hangs = 0
+    env = dict(os.environ)
+    if args.ops:
+        env['FFS_BBTREE_OPS'] = str(args.ops)
+    if args.threads:
+        env['FFS_BBTREE_THREADS'] = str(args.threads)
     for _ in range(args.runs):
         try:
             r = subprocess.run([str(binary()), *[f'ffs_tests::{n}' for n in names], '--exact', '--test-threads=1'],
-                               capture_output=True, text=True, timeout=20)
+                               capture_output=True, text=True, timeout=20, env=env)
         except subprocess.TimeoutExpired as e:
             # A broken latch protocol can also deadlock: the run is counted
             # against the scenario that was running.
@@ -195,6 +228,7 @@ def cmd_replay(args):
 
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument('--bbtree', default=DEFAULT_BBTREE)
     common.add_argument('--iterations', type=int, default=500)
@@ -204,6 +238,12 @@ def main():
     common.add_argument('--watch-hold', type=float, default=0.0)
     common.add_argument('--max-depth', type=int, default=200000)
     common.add_argument('--ops', type=int, default=0, help='operations per model thread (FFS_BBTREE_OPS)')
+    common.add_argument('--threads', type=int, default=0, help='threads of a shared-keys scenario (FFS_BBTREE_THREADS)')
+    common.add_argument('-j', '--jobs', type=int, default=1, help='ffs sessions at a time')
+    common.add_argument('--only', help='a regex the scenario names must match')
+    common.add_argument('--skip', help='a regex the scenario names must not match')
+    common.add_argument('--ffs-arg', action='append', default=[], help='an extra argument for ffs explore (--ffs-arg=--pct-depth --ffs-arg=6)')
+    common.add_argument('--timeout', type=int, default=7200, help='seconds per exploration')
     common.add_argument('--runs', type=int, default=1000)
     common.add_argument('--binary', help='a test binary other than the one setup built (a mutant)')
     common.add_argument('--tag', default='', help='a prefix for the output directory')

@@ -211,6 +211,7 @@ pub fn describe(ev: &Event) -> String {
         Event::Begin => "ffs_begin()".to_string(),
         Event::End => "ffs_end()".to_string(),
         Event::Yield => "ffs_yield()".to_string(),
+        Event::Point => "ffs_point()".to_string(),
         Event::AssertFailed { msg } => format!("ffs_assert failed: {msg}"),
         Event::Fork => "checkpoint".to_string(),
     }

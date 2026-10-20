@@ -58,7 +58,8 @@ syscall with a number Linux does not implement, so natively it returns
 | `ffs_checkpoint("name")` | take a checkpoint here; `ffs explore` roots its search at it |
 | `ffs_begin()` / `ffs_end()` | mark the region of interest (also a valid root; after `ffs_end()` branches finish with a fixed schedule) |
 | `ffs_assert(cond, "msg")` | report a property violation; the failing schedule is saved |
-| `ffs_yield()` | extra scheduling point |
+| `ffs_yield()` | extra scheduling point where the thread waits for another (PCT demotes it, as after `sched_yield`) |
+| `ffs_point()` | extra scheduling point with no wait implied: random policies may switch, PCT keeps its priorities (for a point inside a critical section that other threads spin for) |
 | `ffs_log("msg")` | print through the tracer |
 | `ffs_is_active()` | 1 under ffs |
 | `ffs_watch(addr, len)` | hardware-watch these 8-byte slots in every branch (heap state with no symbol; before the root) |
@@ -109,8 +110,8 @@ code page is taken to be busy-waiting: its slices shrink (down to 16k
 ticks), and PCT and FIFO treat its preemptions as yields, so a spinner
 neither burns virtual time nor starves lower-priority threads.
 
-Scheduling points are syscalls, `ffs_yield()`, and three kinds of
-preemption inside user code:
+Scheduling points are syscalls, `ffs_yield()`, `ffs_point()`, and three
+kinds of preemption inside user code:
 
 * **tick budgets**: with probability `--preempt-prob` a slice gets a
   log-uniform budget of up to `--max-budget` retired conditional branches;

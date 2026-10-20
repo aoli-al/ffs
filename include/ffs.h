@@ -27,6 +27,7 @@ extern "C" {
 #define FFS_SYS_BEGIN       (FFS_SYS_BASE + 6)  /* () -> 0 ; start of the region to explore */
 #define FFS_SYS_END         (FFS_SYS_BASE + 7)  /* () -> 0 ; end of the region to explore */
 #define FFS_SYS_WATCH       (FFS_SYS_BASE + 8)  /* (const void* addr, size_t len) -> 0 */
+#define FFS_SYS_POINT       (FFS_SYS_BASE + 9)  /* () -> 0 ; scheduling point, not a yield */
 
 /* Create a checkpoint of the whole process here.  Under `ffs explore` the
  * exploration tree is rooted at the most recent checkpoint; under `ffs record`
@@ -41,9 +42,19 @@ static inline long ffs_assert(long cond, const char* msg) {
   return syscall(FFS_SYS_ASSERT, cond, msg);
 }
 
-/* Hint to the scheduler that this is a good place to switch threads. */
+/* Hint to the scheduler that this is a good place to switch threads, as
+ * sched_yield would: the thread waits for another, so policies with strict
+ * priorities (PCT) demote it. */
 static inline long ffs_yield(void) {
   return syscall(FFS_SYS_YIELD);
+}
+
+/* A place where a switch is interesting, with no hint that the thread
+ * waits: random policies may switch here as at any event; PCT keeps its
+ * priorities.  For a point inside a critical section (a yield there would
+ * put the holder below the threads spinning for what it holds). */
+static inline long ffs_point(void) {
+  return syscall(FFS_SYS_POINT);
 }
 
 /* Print a message through the tracer (prefixed with the thread id). */

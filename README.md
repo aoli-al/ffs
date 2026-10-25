@@ -1,5 +1,9 @@
 # ffs — fork-based deterministic concurrency testing
 
+> [!INFO]
+> I'm still actively working on this project and don't really have time to maintain a proper README.
+> The current README is 100% AI-generated. If something in it doesn't make sense, try asking your AI model to read and explain it.
+
 `ffs` is a Linux/x86-64 concurrency testing tool written in Rust. It runs an
 unmodified multithreaded program under `ptrace`, serializes its threads onto a
 deterministic scheduler (one tracee thread runs at a time), records the

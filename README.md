@@ -1,6 +1,6 @@
 # ffs — fork-based deterministic concurrency testing
 
-> [!INFO]
+> [!NOTE] 
 > I'm still actively working on this project and don't really have time to maintain a proper README.
 > The current README is 100% AI-generated. If something in it doesn't make sense, try asking your AI model to read and explain it.
 
